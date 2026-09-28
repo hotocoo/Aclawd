@@ -1,16 +1,18 @@
-// Microsoft Foundry provider module implements model/runtime integration.
 import type { ProviderNormalizeResolvedModelContext } from "openclaw/plugin-sdk/core";
-import type {
-  ModelProviderConfig,
-  ProviderPlugin,
+import {
+  resolveClaudeThinkingProfile,
+  supportsClaudeNativeMaxEffort,
+  type ModelProviderConfig,
+  type ProviderPlugin,
 } from "openclaw/plugin-sdk/provider-model-shared";
-import { OPENAI_RESPONSES_STREAM_HOOKS } from "openclaw/plugin-sdk/provider-stream-family";
+import { buildProviderStreamFamilyHooks } from "openclaw/plugin-sdk/provider-stream-family";
 import { apiKeyAuthMethod, entraIdAuthMethod } from "./auth.js";
 import { prepareFoundryRuntimeAuth } from "./runtime.js";
 import {
   PROVIDER_ID,
   applyFoundryProfileBinding,
   applyFoundryProviderConfig,
+  buildFoundryModelConfig,
   buildFoundryProviderBaseUrl,
   extractFoundryEndpoint,
   isFoundryProviderApi,
@@ -21,7 +23,8 @@ import {
 
 type FoundryProviderHooks = Pick<ProviderPlugin, "wrapStreamFn">;
 
-const wrapOpenAIResponsesStreamFn = OPENAI_RESPONSES_STREAM_HOOKS.wrapStreamFn;
+const openAIResponsesStreamHooks = buildProviderStreamFamilyHooks("openai-responses-defaults");
+const wrapOpenAIResponsesStreamFn = openAIResponsesStreamHooks.wrapStreamFn;
 
 const wrapMicrosoftFoundryStreamFn: NonNullable<FoundryProviderHooks["wrapStreamFn"]> = (ctx) => {
   if (ctx.model?.api !== "openai-responses") {
@@ -75,27 +78,38 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
       const existingModel = configuredModels.find(
         (model: { id: string }) => model.id === selectedModelId,
       );
+      const existingModelApi = isFoundryProviderApi(existingModel?.api)
+        ? existingModel.api
+        : undefined;
+      const providerApiForExistingModel =
+        existingModel && isFoundryProviderApi(providerConfig.api) ? providerConfig.api : undefined;
       const selectedModelCapabilities = resolveFoundryModelCapabilities(
         selectedModelId,
         existingModel?.name,
-        isFoundryProviderApi(existingModel?.api) ? existingModel.api : providerConfig.api,
+        existingModelApi ?? providerApiForExistingModel,
         existingModel?.input,
       );
       const providerEndpoint = normalizeFoundryEndpoint(providerConfig.baseUrl ?? "");
-      // Prefer the persisted per-model API choice from onboarding/discovery so arbitrary
-      // deployment aliases (for example prod-primary) do not fall back to name heuristics.
-      const selectedModelApi = isFoundryProviderApi(existingModel?.api)
-        ? existingModel.api
-        : providerConfig.api;
+      const selectedProviderEndpoint =
+        extractFoundryEndpoint(existingModel?.baseUrl) ?? providerEndpoint;
       const nextModels = configuredModels.map((model) => {
         if (model.id !== selectedModelId) {
           return model;
         }
+        const selectedModelEndpoint = extractFoundryEndpoint(model.baseUrl) ?? providerEndpoint;
+        const selectedModelBaseUrl = buildFoundryProviderBaseUrl(
+          selectedModelEndpoint,
+          selectedModelId,
+          selectedModelCapabilities.modelName,
+          selectedModelCapabilities.api,
+        );
         const nextModel = Object.assign({}, model, {
           name: selectedModelCapabilities.modelName,
           api: selectedModelCapabilities.api,
+          baseUrl: selectedModelBaseUrl,
           reasoning: selectedModelCapabilities.reasoning || model.reasoning,
           thinkingLevelMap: selectedModelCapabilities.thinkingLevelMap ?? model.thinkingLevelMap,
+          params: { ...model.params, canonicalModelId: selectedModelCapabilities.modelName },
           input: selectedModelCapabilities.input,
         });
         if (selectedModelCapabilities.compat) {
@@ -127,28 +141,17 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         return nextModel;
       });
       if (!nextModels.some((model) => model.id === selectedModelId)) {
-        nextModels.push({
-          id: selectedModelId,
-          name: selectedModelCapabilities.modelName,
-          api: selectedModelCapabilities.api,
-          reasoning: selectedModelCapabilities.reasoning,
-          ...(selectedModelCapabilities.thinkingLevelMap
-            ? { thinkingLevelMap: selectedModelCapabilities.thinkingLevelMap }
-            : {}),
-          input: selectedModelCapabilities.input,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 128_000,
-          maxTokens: 16_384,
-          ...(selectedModelCapabilities.compat ? { compat: selectedModelCapabilities.compat } : {}),
-        });
+        nextModels.push(
+          buildFoundryModelConfig(providerEndpoint, selectedModelId, selectedModelCapabilities),
+        );
       }
       const nextProviderConfig: ModelProviderConfig = {
         ...providerConfig,
         baseUrl: buildFoundryProviderBaseUrl(
-          providerEndpoint,
+          selectedProviderEndpoint,
           selectedModelId,
           selectedModelCapabilities.modelName,
-          selectedModelApi,
+          selectedModelCapabilities.api,
         ),
         api: selectedModelCapabilities.api,
         models: nextModels,
@@ -158,6 +161,17 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         applyFoundryProfileBinding(ctx.config, targetProfileId);
       }
       applyFoundryProviderConfig(ctx.config, nextProviderConfig);
+    },
+    resolveThinkingProfile: ({ modelId, params }) => {
+      const modelName =
+        typeof params?.canonicalModelId === "string" ? params.canonicalModelId : undefined;
+      const capabilities = resolveFoundryModelCapabilities(modelId, modelName);
+      if (!capabilities.reasoning || capabilities.api !== "anthropic-messages") {
+        return undefined;
+      }
+      return resolveClaudeThinkingProfile(capabilities.modelName, undefined, {
+        includeNativeMax: supportsClaudeNativeMaxEffort({ id: capabilities.modelName }),
+      });
     },
     normalizeResolvedModel: ({ modelId, model }: ProviderNormalizeResolvedModelContext) => {
       const endpoint = extractFoundryEndpoint(model.baseUrl ?? "");
@@ -199,6 +213,7 @@ export function buildMicrosoftFoundryProvider(): ProviderPlugin {
         api: capabilities.api,
         reasoning: capabilities.reasoning || model.reasoning,
         thinkingLevelMap: capabilities.thinkingLevelMap ?? model.thinkingLevelMap,
+        params: { ...model.params, canonicalModelId: capabilities.modelName },
         input: capabilities.input,
         baseUrl: buildFoundryProviderBaseUrl(
           endpoint,

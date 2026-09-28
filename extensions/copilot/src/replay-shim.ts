@@ -1,26 +1,6 @@
-// Replay-shim for the GitHub Copilot agent runtime.
-//
-// Owns three concerns:
-//   1. Pre-call: should this attempt resume an existing SDK session or
-//      start a new one? Honours `initialReplayState.sdkSessionId` and
-//      `initialReplayState.replayInvalid`.
-//   2. Post-call: if `resumeSession` fails, was the failure recoverable
-//      (session-gone) so we should downgrade to `createSession`, or
-//      unrecoverable so the error should surface as a prompt error?
-//   3. Result-time: compute the `replayMetadata` to attach to the attempt
-//      result, propagating prior state with worst-case-wins semantics so
-//      the orchestrator never replays an attempt that may have committed
-//      partial side effects.
-//
-// Host back-pointers (NOT imported here to keep the package boundary
-// clean):
-//   - `src/agents/pi-embedded-runner/replay-state.ts` — canonical
-//     `EmbeddedRunReplayState` / `EmbeddedRunReplayMetadata` shapes
-//     and `replayMetadataFromState`.
-//   - `src/agents/pi-embedded-runner/run/types.ts` —
-//     `AgentHarnessAttemptResult.replayMetadata` field requirement.
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
-export type ReplayDecision =
+type ReplayDecision =
   | {
       readonly action: "resume";
       readonly sdkSessionId: string;
@@ -32,30 +12,11 @@ export type ReplayDecision =
       readonly downgradeReason: "no-replay-state" | "no-sdk-session-id" | "replay-invalid";
     };
 
-export interface ReplayShimInput {
+interface ReplayShimInput {
   readonly sdkSessionId?: string;
   readonly replayInvalid?: boolean;
 }
 
-function normalizeSdkSessionId(value: unknown): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-/**
- * Pure pre-call decision: should attempt.ts call resumeSession or
- * createSession?
- *
- * Rules:
- *   - No input                            → create (no-replay-state)
- *   - No (trimmed) sdkSessionId          → create (no-sdk-session-id)
- *   - sdkSessionId + replayInvalid=true   → create (replay-invalid),
- *                                            downgradedFromResume=true
- *   - sdkSessionId + replayInvalid=false  → resume
- */
 export function decideReplayAction(input?: ReplayShimInput): ReplayDecision {
   if (!input) {
     return {
@@ -64,7 +25,7 @@ export function decideReplayAction(input?: ReplayShimInput): ReplayDecision {
       downgradeReason: "no-replay-state",
     };
   }
-  const sdkSessionId = normalizeSdkSessionId(input.sdkSessionId);
+  const sdkSessionId = normalizeOptionalString(input.sdkSessionId);
   if (!sdkSessionId) {
     return {
       action: "create",
@@ -86,9 +47,9 @@ export function decideReplayAction(input?: ReplayShimInput): ReplayDecision {
   };
 }
 
-export type ResumeFailureKind = "missing" | "unknown";
+type ResumeFailureKind = "missing" | "unknown";
 
-export interface ResumeFailureClassification {
+interface ResumeFailureClassification {
   readonly recoverable: boolean;
   readonly kind: ResumeFailureKind;
 }
@@ -116,24 +77,8 @@ function readErrorField(error: unknown, key: string): unknown {
   return (error as Record<string, unknown>)[key];
 }
 
-/**
- * Post-call: classify a resumeSession() failure so attempt.ts can
- * decide whether to downgrade silently to createSession.
- *
- * Conservative: only treats clearly session-gone signals as recoverable.
- * Structured signals (status === 404, recognised code strings) are
- * checked first; message matching is a fallback because SDK error
- * messages are not part of the typed contract.
- *
- * Everything else (transport errors, auth failures, generic Error) is
- * unrecoverable and should surface to the outer attempt.ts try/catch
- * which converts it to a prompt error.
- */
+// Only missing sessions permit recovery; auth and transport failures must surface.
 export function classifyResumeFailure(error: unknown): ResumeFailureClassification {
-  if (error === undefined || error === null) {
-    return { recoverable: false, kind: "unknown" };
-  }
-
   const status = readErrorField(error, "status");
   if (status === 404) {
     return { recoverable: true, kind: "missing" };
@@ -148,26 +93,18 @@ export function classifyResumeFailure(error: unknown): ResumeFailureClassificati
     return { recoverable: true, kind: "missing" };
   }
 
-  const message =
-    error instanceof Error
-      ? error.message
-      : typeof error === "object"
-        ? typeof (error as { message?: unknown }).message === "string"
-          ? (error as { message: string }).message
-          : undefined
-        : undefined;
-  if (typeof message === "string") {
-    for (const pattern of MISSING_SESSION_MESSAGE_PATTERNS) {
-      if (pattern.test(message)) {
-        return { recoverable: true, kind: "missing" };
-      }
-    }
+  const message = readErrorField(error, "message");
+  if (
+    typeof message === "string" &&
+    MISSING_SESSION_MESSAGE_PATTERNS.some((pattern) => pattern.test(message))
+  ) {
+    return { recoverable: true, kind: "missing" };
   }
 
   return { recoverable: false, kind: "unknown" };
 }
 
-export interface ReplayMetadataComputeInput {
+interface ReplayMetadataComputeInput {
   readonly priorReplayInvalid?: boolean;
   readonly priorHadPotentialSideEffects?: boolean;
   readonly thisAttemptTimedOut?: boolean;
@@ -176,31 +113,13 @@ export interface ReplayMetadataComputeInput {
   readonly thisAttemptResumeFailureRecovered?: boolean;
 }
 
-export interface ComputedReplayMetadata {
+interface ComputedReplayMetadata {
   readonly hadPotentialSideEffects: boolean;
   readonly replaySafe: boolean;
 }
 
-/**
- * Compute the `EmbeddedRunReplayMetadata` to attach to the attempt
- * result. Worst-case-wins:
- *
- *   hadPotentialSideEffects = priorHadPotentialSideEffects OR timedOut
- *     OR thisAttemptHadPotentialSideEffects
- *     (timeout means we cannot prove the prompt was not partially
- *     committed server-side; treat as side-effecting so the
- *     orchestrator will not blindly re-issue the same prompt).
- *
- *   replaySafe = NOT (
- *     priorReplayInvalid
- *     OR thisAttemptDowngradedFromResume
- *     OR thisAttemptResumeFailureRecovered
- *     OR hadPotentialSideEffects
- *   )
- *
- * Matches the parity rule in
- * `src/agents/pi-embedded-runner/replay-state.ts#replayMetadataFromState`.
- */
+// A timeout may have committed work server-side, so it is side-effecting even
+// without an observed tool call. Replay carries the worst outcome across attempts.
 export function computeReplayMetadata(input: ReplayMetadataComputeInput): ComputedReplayMetadata {
   const priorReplayInvalid = input.priorReplayInvalid === true;
   const priorHadPotentialSideEffects = input.priorHadPotentialSideEffects === true;
@@ -223,7 +142,6 @@ const COPILOT_REPLAY_SAFE_READ_ONLY_TOOL_NAMES = new Set([
   "list",
   "ls",
   "memory_get",
-  "memory_search",
   "probe",
   "query",
   "read",
@@ -242,11 +160,8 @@ export function copilotToolMetasHavePotentialSideEffects(
   toolMetas?: readonly { asyncStarted?: boolean; toolName: string }[],
 ): boolean {
   return (toolMetas ?? []).some(
-    (entry) => entry.asyncStarted === true || !isReplaySafeReadOnlyToolName(entry.toolName),
+    (entry) =>
+      entry.asyncStarted === true ||
+      !COPILOT_REPLAY_SAFE_READ_ONLY_TOOL_NAMES.has(entry.toolName.trim().toLowerCase()),
   );
-}
-
-function isReplaySafeReadOnlyToolName(toolName: string): boolean {
-  const normalized = toolName.trim().toLowerCase();
-  return COPILOT_REPLAY_SAFE_READ_ONLY_TOOL_NAMES.has(normalized);
 }

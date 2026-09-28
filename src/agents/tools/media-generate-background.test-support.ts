@@ -1,21 +1,16 @@
 // Media generation background test support centralizes task/announcement mocks
 // and assertions shared by image, video, and music generation tests.
 import { expect, vi } from "vitest";
+import {
+  resetGeneratedMediaTaskActivityForTests,
+  admitMediaHandle,
+} from "../media-generation-activity.test-support.js";
+import type { createMediaGenerationTaskLifecycle } from "./media-generate-background-shared.js";
 
 type MockWithReset = {
   mockReset(): void;
   mockResolvedValue?(value: unknown): void;
-};
-
-export const taskExecutorMocks = {
-  createRunningTaskRun: vi.fn(),
-  recordTaskRunProgressByRunId: vi.fn(),
-  completeTaskRunByRunId: vi.fn(),
-  failTaskRunByRunId: vi.fn(),
-};
-
-export const announceDeliveryMocks = {
-  deliverSubagentAnnouncement: vi.fn(),
+  mockReturnValue?(value: unknown): void;
 };
 
 export const taskDeliveryRuntimeMocks = {
@@ -23,10 +18,10 @@ export const taskDeliveryRuntimeMocks = {
 };
 
 type TaskExecutorBackgroundMocks = {
-  createRunningTaskRun: MockWithReset;
-  recordTaskRunProgressByRunId: MockWithReset;
-  completeTaskRunByRunId: MockWithReset;
-  failTaskRunByRunId: MockWithReset;
+  createOperation: MockWithReset;
+  recordProgress: MockWithReset;
+  completeOperation: MockWithReset;
+  failOperation: MockWithReset;
 };
 
 type TaskDeliveryBackgroundMocks = {
@@ -56,15 +51,6 @@ type ProgressExpectation = {
   progressSummary: string;
 };
 
-type DirectSendExpectation = {
-  sendMessageMock: unknown;
-  channel: string;
-  to: string;
-  threadId: string;
-  content: string;
-  mediaUrls: string[];
-};
-
 type FallbackAnnouncementExpectation = {
   deliverAnnouncementMock: unknown;
   requesterSessionKey: string;
@@ -77,7 +63,6 @@ type FallbackAnnouncementExpectation = {
 };
 
 type CompletionFixtureParams = {
-  directSend?: boolean;
   mediaUrls?: string[];
   result: string;
   runId: string;
@@ -104,17 +89,13 @@ function requireRecordArray(value: unknown, label: string): Record<string, unkno
 }
 
 export function createMediaCompletionFixture({
-  directSend,
   mediaUrls,
   result,
   runId,
   taskLabel,
 }: CompletionFixtureParams) {
   return {
-    ...(directSend
-      ? { config: { tools: { media: { asyncCompletion: { directSend: true } } } } }
-      : {}),
-    handle: {
+    handle: admitMediaHandle({
       taskId: "task-123",
       runId,
       requesterSessionKey: "agent:main:discord:direct:123",
@@ -124,7 +105,7 @@ export function createMediaCompletionFixture({
         threadId: "thread-1",
       },
       taskLabel,
-    },
+    }),
     status: "ok" as const,
     statusLabel: "completed successfully",
     result,
@@ -137,10 +118,11 @@ export function resetMediaBackgroundMocks({
   taskDeliveryRuntimeMocks: taskDeliveryRuntimeMocksLocal,
   announceDeliveryMocks: announceDeliveryMocksLocal,
 }: MediaBackgroundResetMocks): void {
-  taskExecutorMocksResult.createRunningTaskRun.mockReset();
-  taskExecutorMocksResult.recordTaskRunProgressByRunId.mockReset();
-  taskExecutorMocksResult.completeTaskRunByRunId.mockReset();
-  taskExecutorMocksResult.failTaskRunByRunId.mockReset();
+  resetGeneratedMediaTaskActivityForTests();
+  taskExecutorMocksResult.createOperation.mockReset();
+  taskExecutorMocksResult.recordProgress.mockReset();
+  taskExecutorMocksResult.completeOperation.mockReset();
+  taskExecutorMocksResult.failOperation.mockReset();
   taskDeliveryRuntimeMocksLocal.sendMessage.mockReset();
   taskDeliveryRuntimeMocksLocal.sendMessage.mockResolvedValue?.({
     channel: "discord",
@@ -159,8 +141,8 @@ export function expectQueuedTaskRun({
   progressSummary,
 }: QueuedTaskExpectation): void {
   const params = requireMockFirstParam(
-    taskExecutorMocksValue.createRunningTaskRun,
-    "createRunningTaskRun params",
+    taskExecutorMocksValue.createOperation,
+    "createOperation params",
   );
   expect(params.taskKind).toBe(taskKind);
   expect(params.sourceId).toBe(sourceId);
@@ -173,27 +155,11 @@ export function expectRecordedTaskProgress({
   progressSummary,
 }: ProgressExpectation): void {
   const params = requireMockFirstParam(
-    taskExecutorMocksLocal.recordTaskRunProgressByRunId,
-    "recordTaskRunProgressByRunId params",
+    taskExecutorMocksLocal.recordProgress,
+    "recordProgress params",
   );
   expect(params.runId).toBe(runId);
   expect(params.progressSummary).toBe(progressSummary);
-}
-
-export function expectDirectMediaSend({
-  sendMessageMock,
-  channel,
-  to,
-  threadId,
-  content,
-  mediaUrls,
-}: DirectSendExpectation): void {
-  const params = requireMockFirstParam(sendMessageMock, "sendMessage params");
-  expect(params.channel).toBe(channel);
-  expect(params.to).toBe(to);
-  expect(params.threadId).toBe(threadId);
-  expect(params.content).toBe(content);
-  expect(params.mediaUrls).toEqual(mediaUrls);
 }
 
 export function expectFallbackMediaAnnouncement({
@@ -214,9 +180,12 @@ export function expectFallbackMediaAnnouncement({
     "deliverSubagentAnnouncement params",
   );
   expect(params.requesterSessionKey).toBe(requesterSessionKey);
-  const requesterOrigin = requireRecord(params.requesterOrigin, "requesterOrigin");
-  expect(requesterOrigin.channel).toBe(channel);
-  expect(requesterOrigin.to).toBe(to);
+  const requesterSessionOrigin = requireRecord(
+    params.requesterSessionOrigin,
+    "requesterSessionOrigin",
+  );
+  expect(requesterSessionOrigin.channel).toBe(channel);
+  expect(requesterSessionOrigin.to).toBe(to);
   expect(params.expectsCompletionMessage).toBe(true);
 
   const event = requireRecordArray(params.internalEvents, "internalEvents").find(
@@ -230,3 +199,15 @@ export function expectFallbackMediaAnnouncement({
   expect(event.mediaUrls).toEqual(mediaUrls);
   expect(String(event.replyInstruction)).toContain("visible-reply contract");
 }
+
+export const imageMediaLifecycleOptions = {
+  toolName: "image_generate",
+  taskKind: "image_generation",
+  label: "Image generation",
+  queuedProgressSummary: "Queued image generation",
+  generatedLabel: "image",
+  failureProgressSummary: "Image generation failed",
+  eventSource: "image_generation",
+  announceType: "image generation task",
+  completionLabel: "image",
+} satisfies Parameters<typeof createMediaGenerationTaskLifecycle>[0];

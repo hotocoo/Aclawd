@@ -34,7 +34,7 @@ function resolvePluginNodeCapabilityRouteSurface(
 }
 
 /** Lists all node-capability routes matching the already canonicalized path context. */
-export function findMatchingPluginNodeCapabilityRoutes(
+function findMatchingPluginNodeCapabilityRoutes(
   registry: PluginRegistry,
   context: PluginRoutePathContext,
 ): PluginNodeCapabilityRoute[] {
@@ -55,11 +55,6 @@ export function findMatchingPluginNodeCapabilityRoute(
   return findMatchingPluginNodeCapabilityRoutes(registry, context)[0];
 }
 
-/** Lists node-capability surface names advertised by the active plugin registry. */
-export function listPluginNodeCapabilitySurfaces(registry: PluginRegistry): string[] {
-  return listPluginNodeCapabilities(registry).map((entry) => entry.surface);
-}
-
 /** Lists unique node-capability surfaces, preferring the shortest TTL per surface. */
 export function listPluginNodeCapabilities(
   registry: PluginRegistry,
@@ -70,14 +65,13 @@ export function listPluginNodeCapabilities(
     if (surface) {
       const next = resolvePluginNodeCapabilityRouteSurface(route as PluginNodeCapabilityRoute);
       const existing = surfaces.get(surface);
-      if (!existing || resolveTtlMs(next) < resolveTtlMs(existing)) {
+      if (
+        !existing ||
+        resolvePluginNodeCapabilityTtlMs(next) < resolvePluginNodeCapabilityTtlMs(existing)
+      ) {
         surfaces.set(surface, next);
       }
     }
   }
   return [...surfaces.values()].toSorted((a, b) => a.surface.localeCompare(b.surface));
-}
-
-function resolveTtlMs(surface: PluginNodeCapabilitySurface) {
-  return resolvePluginNodeCapabilityTtlMs(surface);
 }

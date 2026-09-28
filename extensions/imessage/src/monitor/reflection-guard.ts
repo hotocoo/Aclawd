@@ -1,10 +1,12 @@
-// Imessage plugin module implements reflection guard behavior.
 import { findCodeRegions, isInsideCode } from "openclaw/plugin-sdk/text-chunking";
 
 const INTERNAL_SEPARATOR_RE = /(?:#\+){2,}#?/;
 const ASSISTANT_ROLE_MARKER_RE = /\bassistant\s+to\s*=\s*\w+/i;
 // Require closing `>` to avoid false-positives on phrases like "<thought experiment>".
-const THINKING_TAG_RE = /<\s*\/?\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/i;
+// Keep known provider namespaces aligned with the public reasoning-tag contract
+// so reflected hidden reasoning cannot re-enter the agent loop.
+const THINKING_TAG_RE =
+  /<\s*\/?\s*(?:(?:antml:|mm:)?(?:think(?:ing)?|thought)|antthinking)\b[^<>]*>/i;
 const RELEVANT_MEMORIES_TAG_RE = /<\s*\/?\s*relevant[-_]memories\b[^<>]*>/i;
 // Require closing `>` to avoid false-positives on phrases like "<final answer>".
 const FINAL_TAG_RE = /<\s*\/?\s*final\b[^<>]*>/i;
@@ -26,8 +28,11 @@ type ReflectionDetection = {
   matchedLabels: string[];
 };
 
-function hasMatchOutsideCode(text: string, re: RegExp): boolean {
-  const codeRegions = findCodeRegions(text);
+function hasMatchOutsideCode(
+  text: string,
+  re: RegExp,
+  codeRegions: ReturnType<typeof findCodeRegions>,
+): boolean {
   const globalRe = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
 
   for (const match of text.matchAll(globalRe)) {
@@ -49,9 +54,10 @@ export function detectReflectedContent(text: string): ReflectionDetection {
     return { isReflection: false, matchedLabels: [] };
   }
 
+  const codeRegions = findCodeRegions(text);
   const matchedLabels: string[] = [];
   for (const { re, label } of REFLECTION_PATTERNS) {
-    if (hasMatchOutsideCode(text, re)) {
+    if (hasMatchOutsideCode(text, re, codeRegions)) {
       matchedLabels.push(label);
     }
   }

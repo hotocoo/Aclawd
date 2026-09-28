@@ -1,6 +1,31 @@
 import Foundation
 import OpenClawProtocol
 
+func gatewayErrorDetails(_ error: ErrorShape?) -> [String: OpenClawProtocol.AnyCodable] {
+    var details = error?.details?.value as? [String: OpenClawProtocol.AnyCodable] ?? [:]
+    if let error {
+        if details["code"] == nil {
+            details["code"] = OpenClawProtocol.AnyCodable(error.code)
+        } else {
+            details["errorCode"] = OpenClawProtocol.AnyCodable(error.code)
+        }
+        details["message"] = OpenClawProtocol.AnyCodable(error.message)
+        if let retryable = error.retryable {
+            details["retryable"] = OpenClawProtocol.AnyCodable(retryable)
+        }
+        if let retryAfterMs = error.retryafterms {
+            details["retryAfterMs"] = OpenClawProtocol.AnyCodable(retryAfterMs)
+        }
+    }
+    return details
+}
+
+/// A route lease became stale before its request touched the channel. Unlike
+/// a socket cancellation, this proves the payload was never dispatched.
+public enum GatewayNodeSessionRequestError: Error, Sendable {
+    case routeChangedBeforeDispatch
+}
+
 public enum GatewayConnectAuthDetailCode: String, Sendable {
     case authRequired = "AUTH_REQUIRED"
     case authUnauthorized = "AUTH_UNAUTHORIZED"
@@ -18,7 +43,9 @@ public enum GatewayConnectAuthDetailCode: String, Sendable {
     case authTailscaleProxyMissing = "AUTH_TAILSCALE_PROXY_MISSING"
     case authTailscaleWhoisFailed = "AUTH_TAILSCALE_WHOIS_FAILED"
     case authTailscaleIdentityMismatch = "AUTH_TAILSCALE_IDENTITY_MISMATCH"
+    case authVerifiedUserRequired = "AUTH_VERIFIED_USER_REQUIRED"
     case pairingRequired = "PAIRING_REQUIRED"
+    case protocolMismatch = "PROTOCOL_MISMATCH"
     case controlUiDeviceIdentityRequired = "CONTROL_UI_DEVICE_IDENTITY_REQUIRED"
     case deviceIdentityRequired = "DEVICE_IDENTITY_REQUIRED"
     case deviceAuthInvalid = "DEVICE_AUTH_INVALID"
@@ -54,6 +81,10 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
     public let docsURLString: String?
     public let retryableOverride: Bool?
     public let pauseReconnectOverride: Bool?
+    public let clientMinProtocol: Int?
+    public let clientMaxProtocol: Int?
+    public let expectedProtocol: Int?
+    public let minimumProbeProtocol: Int?
 
     public init(
         message: String,
@@ -69,27 +100,31 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
         actionCommand: String? = nil,
         docsURLString: String? = nil,
         retryableOverride: Bool? = nil,
-        pauseReconnectOverride: Bool? = nil)
+        pauseReconnectOverride: Bool? = nil,
+        clientMinProtocol: Int? = nil,
+        clientMaxProtocol: Int? = nil,
+        expectedProtocol: Int? = nil,
+        minimumProbeProtocol: Int? = nil)
     {
         let trimmedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedDetailCode = detailCodeRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedRecommendedNextStep =
-            recommendedNextStepRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.message = trimmedMessage.isEmpty ? "gateway connect failed" : trimmedMessage
-        self.detailCodeRaw = trimmedDetailCode?.isEmpty == false ? trimmedDetailCode : nil
+        self.detailCodeRaw = detailCodeRaw?.trimmedNonEmpty
         self.canRetryWithDeviceToken = canRetryWithDeviceToken
-        self.recommendedNextStepRaw =
-            trimmedRecommendedNextStep?.isEmpty == false ? trimmedRecommendedNextStep : nil
-        self.requestId = Self.trimmedOrNil(requestId)
-        self.detailsReason = Self.trimmedOrNil(detailsReason)
-        self.ownerRaw = Self.trimmedOrNil(ownerRaw)
-        self.titleOverride = Self.trimmedOrNil(titleOverride)
-        self.userMessageOverride = Self.trimmedOrNil(userMessageOverride)
-        self.actionLabel = Self.trimmedOrNil(actionLabel)
-        self.actionCommand = Self.trimmedOrNil(actionCommand)
-        self.docsURLString = Self.trimmedOrNil(docsURLString)
+        self.recommendedNextStepRaw = recommendedNextStepRaw?.trimmedNonEmpty
+        self.requestId = requestId?.trimmedNonEmpty
+        self.detailsReason = detailsReason?.trimmedNonEmpty
+        self.ownerRaw = ownerRaw?.trimmedNonEmpty
+        self.titleOverride = titleOverride?.trimmedNonEmpty
+        self.userMessageOverride = userMessageOverride?.trimmedNonEmpty
+        self.actionLabel = actionLabel?.trimmedNonEmpty
+        self.actionCommand = actionCommand?.trimmedNonEmpty
+        self.docsURLString = docsURLString?.trimmedNonEmpty
         self.retryableOverride = retryableOverride
         self.pauseReconnectOverride = pauseReconnectOverride
+        self.clientMinProtocol = clientMinProtocol
+        self.clientMaxProtocol = clientMaxProtocol
+        self.expectedProtocol = expectedProtocol
+        self.minimumProbeProtocol = minimumProbeProtocol
     }
 
     public init(
@@ -106,7 +141,11 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
         actionCommand: String? = nil,
         docsURLString: String? = nil,
         retryableOverride: Bool? = nil,
-        pauseReconnectOverride: Bool? = nil)
+        pauseReconnectOverride: Bool? = nil,
+        clientMinProtocol: Int? = nil,
+        clientMaxProtocol: Int? = nil,
+        expectedProtocol: Int? = nil,
+        minimumProbeProtocol: Int? = nil)
     {
         self.init(
             message: message,
@@ -122,12 +161,11 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
             actionCommand: actionCommand,
             docsURLString: docsURLString,
             retryableOverride: retryableOverride,
-            pauseReconnectOverride: pauseReconnectOverride)
-    }
-
-    private static func trimmedOrNil(_ value: String?) -> String? {
-        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? nil : trimmed
+            pauseReconnectOverride: pauseReconnectOverride,
+            clientMinProtocol: clientMinProtocol,
+            clientMaxProtocol: clientMaxProtocol,
+            expectedProtocol: expectedProtocol,
+            minimumProbeProtocol: minimumProbeProtocol)
     }
 
     public var detailCode: String? {
@@ -152,6 +190,14 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
         self.message
     }
 
+    public func isProtocolMismatch(supportedProtocols: ClosedRange<Int>) -> Bool {
+        // Published protocol-3 gateways only send INVALID_REQUEST + expectedProtocol.
+        // Compare the advertised role range: node clients still accept protocol 3.
+        self.detail == .protocolMismatch ||
+            (self.detailCode == "INVALID_REQUEST" &&
+                self.expectedProtocol.map { !supportedProtocols.contains($0) } == true)
+    }
+
     public var isNonRecoverable: Bool {
         switch self.detail {
         case .authTokenMissing,
@@ -162,7 +208,9 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
              .authPasswordNotConfigured,
              .authRateLimited,
              .authScopeMismatch,
+             .authVerifiedUserRequired,
              .pairingRequired,
+             .protocolMismatch,
              .controlUiDeviceIdentityRequired,
              .deviceIdentityRequired:
             true
@@ -173,6 +221,16 @@ public struct GatewayConnectAuthError: LocalizedError, Sendable {
 }
 
 /// Structured error surfaced when the gateway responds with `{ ok: false }`.
+public struct GatewayMissingScopeErrorDetails: Equatable, Sendable {
+    public let missingScope: String
+    public let requiredScopes: [String]
+
+    public init(missingScope: String, requiredScopes: [String]) {
+        self.missingScope = missingScope
+        self.requiredScopes = requiredScopes
+    }
+}
+
 public struct GatewayResponseError: LocalizedError, @unchecked Sendable {
     public let method: String
     public let code: String
@@ -181,19 +239,44 @@ public struct GatewayResponseError: LocalizedError, @unchecked Sendable {
 
     public init(method: String, code: String?, message: String?, details: [String: AnyCodable]?) {
         self.method = method
-        self.code = (code?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? code!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : "GATEWAY_ERROR"
-        self.message = (message?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
-            ? message!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : "gateway error"
+        self.code = code?.trimmedNonEmpty ?? "GATEWAY_ERROR"
+        self.message = message?.trimmedNonEmpty ?? "gateway error"
         self.details = details ?? [:]
     }
 
     public var detailsReason: String? {
-        let raw = self.details["reason"]?.value as? String
-        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? nil : trimmed
+        self.details["reason"]?.stringValue?.trimmedNonEmpty
+    }
+
+    public var missingScopeDetails: GatewayMissingScopeErrorDetails? {
+        guard self.details["code"]?.stringValue == "MISSING_SCOPE" else { return nil }
+        guard let missingScope = self.details["missingScope"]?.stringValue?.trimmedNonEmpty,
+              let values = self.details["requiredScopes"]?.arrayValue
+        else {
+            return nil
+        }
+        let requiredScopes = values.compactMap { $0.stringValue?.trimmedNonEmpty }
+        guard !requiredScopes.isEmpty, requiredScopes.count == values.count else { return nil }
+        return GatewayMissingScopeErrorDetails(
+            missingScope: missingScope,
+            requiredScopes: requiredScopes)
+    }
+
+    /// Structured missing scope with a fallback for gateways predating error details.
+    public var missingScope: String? {
+        if let structured = self.missingScopeDetails { return structured.missingScope }
+        guard self.code == "FORBIDDEN" || self.code == "INVALID_REQUEST" else { return nil }
+        guard let marker = self.message.range(of: "missing scope:", options: .caseInsensitive) else {
+            return nil
+        }
+        let suffix = self.message[marker.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+        return suffix.split(whereSeparator: { $0.isWhitespace }).first.map(String.init)
+    }
+
+    public var isAuthorizationFailure: Bool {
+        if self.missingScope != nil { return true }
+        return self.code == "INVALID_REQUEST" &&
+            self.message.localizedCaseInsensitiveContains("unauthorized role")
     }
 
     public var errorDescription: String? {

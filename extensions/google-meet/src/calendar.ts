@@ -1,11 +1,12 @@
-// Google Meet plugin module implements calendar behavior.
+import { readProviderJsonResponse } from "openclaw/plugin-sdk/provider-http";
 import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
 import { googleApiError } from "./google-api-errors.js";
+import { normalizeMeetUrl } from "./meet-url.js";
 
 const GOOGLE_CALENDAR_API_BASE_URL = "https://www.googleapis.com/calendar/v3";
 const GOOGLE_CALENDAR_API_HOST = "www.googleapis.com";
-const GOOGLE_MEET_URL_HOST = "meet.google.com";
 const GOOGLE_CALENDAR_EVENTS_SCOPE = "https://www.googleapis.com/auth/calendar.events.readonly";
+const GOOGLE_CALENDAR_REQUEST_TIMEOUT_MS = 30_000;
 
 type GoogleCalendarEventDate = {
   date?: string;
@@ -64,38 +65,75 @@ function appendQuery(url: string, query: Record<string, string | number | boolea
   return parsed.toString();
 }
 
-function isGoogleMeetUri(value: string | undefined): value is string {
+function normalizeGoogleMeetCalendarUri(value: string | undefined): string | undefined {
   if (!value?.trim()) {
-    return false;
+    return undefined;
   }
   try {
-    return new URL(value).hostname === GOOGLE_MEET_URL_HOST;
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return undefined;
+    }
+    if (
+      url.hostname.toLowerCase() !== "meet.google.com" ||
+      url.port ||
+      url.username ||
+      url.password
+    ) {
+      return undefined;
+    }
+    // Calendar entry points may use HTTP. Upgrade before passing the URL to the
+    // stricter runtime boundary so browser and node-host navigation stay HTTPS-only.
+    url.protocol = "https:";
+    return normalizeMeetUrl(url.toString());
   } catch {
-    return false;
+    return undefined;
   }
 }
 
 function extractGoogleMeetUriFromText(value: string | undefined): string | undefined {
-  const match = value?.match(/https:\/\/meet\.google\.com\/[a-z0-9-]+/i);
-  return match?.[0];
+  const matches = value?.matchAll(/https:\/\/meet\.google\.com\/[a-z0-9-]+/gi);
+  for (const match of matches ?? []) {
+    const uri = normalizeGoogleMeetCalendarUri(match[0]);
+    if (uri) {
+      return uri;
+    }
+  }
+  return undefined;
 }
 
-export function extractGoogleMeetUriFromCalendarEvent(
-  event: GoogleMeetCalendarEvent,
+function findFirstGoogleMeetCalendarUri(
+  entryPoints: GoogleCalendarConferenceEntryPoint[],
+  predicate: (entry: GoogleCalendarConferenceEntryPoint) => boolean = () => true,
 ): string | undefined {
-  if (isGoogleMeetUri(event.hangoutLink)) {
-    return event.hangoutLink;
+  for (const entry of entryPoints) {
+    if (!predicate(entry)) {
+      continue;
+    }
+    const uri = normalizeGoogleMeetCalendarUri(entry.uri);
+    if (uri) {
+      return uri;
+    }
+  }
+  return undefined;
+}
+
+function extractGoogleMeetUriFromCalendarEvent(event: GoogleMeetCalendarEvent): string | undefined {
+  const hangoutLink = normalizeGoogleMeetCalendarUri(event.hangoutLink);
+  if (hangoutLink) {
+    return hangoutLink;
   }
   const entryPoints = event.conferenceData?.entryPoints ?? [];
-  const videoEntry = entryPoints.find(
-    (entry) => entry.entryPointType === "video" && isGoogleMeetUri(entry.uri),
+  const videoEntryUri = findFirstGoogleMeetCalendarUri(
+    entryPoints,
+    (entry) => entry.entryPointType === "video",
   );
-  if (videoEntry?.uri) {
-    return videoEntry.uri;
+  if (videoEntryUri) {
+    return videoEntryUri;
   }
-  const meetEntry = entryPoints.find((entry) => isGoogleMeetUri(entry.uri));
-  if (meetEntry?.uri) {
-    return meetEntry.uri;
+  const meetEntryUri = findFirstGoogleMeetCalendarUri(entryPoints);
+  if (meetEntryUri) {
+    return meetEntryUri;
   }
   return (
     extractGoogleMeetUriFromText(event.location) ?? extractGoogleMeetUriFromText(event.description)
@@ -154,7 +192,7 @@ function chooseBestMeetCalendarEvent(
   return selected;
 }
 
-async function fetchGoogleCalendarEvents(params: {
+type GoogleMeetCalendarQuery = {
   accessToken: string;
   calendarId?: string;
   eventQuery?: string;
@@ -162,7 +200,11 @@ async function fetchGoogleCalendarEvents(params: {
   timeMax?: string;
   maxResults?: number;
   now?: Date;
-}): Promise<{ calendarId: string; events: GoogleMeetCalendarEvent[]; now: Date }> {
+};
+
+async function fetchGoogleCalendarEvents(
+  params: GoogleMeetCalendarQuery,
+): Promise<{ calendarId: string; events: GoogleMeetCalendarEvent[]; now: Date }> {
   const calendarId = params.calendarId?.trim() || "primary";
   const now = params.now ?? new Date();
   const defaultTimeMax = new Date(now);
@@ -188,18 +230,20 @@ async function fetchGoogleCalendarEvents(params: {
     },
     policy: { allowedHostnames: [GOOGLE_CALENDAR_API_HOST] },
     auditContext: "google-meet.calendar.events.list",
+    timeoutMs: GOOGLE_CALENDAR_REQUEST_TIMEOUT_MS,
   });
   try {
     if (!response.ok) {
-      const detail = await response.text();
       throw await googleApiError({
         response,
-        detail,
         prefix: "Google Calendar events.list",
         scopes: [GOOGLE_CALENDAR_EVENTS_SCOPE],
       });
     }
-    const payload = (await response.json()) as { items?: unknown };
+    const payload = await readProviderJsonResponse<{ items?: unknown }>(
+      response,
+      "Google Calendar events.list",
+    );
     if (payload.items !== undefined && !Array.isArray(payload.items)) {
       throw new Error("Google Calendar events.list response had non-array items");
     }
@@ -209,15 +253,9 @@ async function fetchGoogleCalendarEvents(params: {
   }
 }
 
-export async function listGoogleMeetCalendarEvents(params: {
-  accessToken: string;
-  calendarId?: string;
-  eventQuery?: string;
-  timeMin?: string;
-  timeMax?: string;
-  maxResults?: number;
-  now?: Date;
-}): Promise<GoogleMeetCalendarEventsResult> {
+export async function listGoogleMeetCalendarEvents(
+  params: GoogleMeetCalendarQuery,
+): Promise<GoogleMeetCalendarEventsResult> {
   const { calendarId, events, now } = await fetchGoogleCalendarEvents(params);
   const best = chooseBestMeetCalendarEvent(events, now);
   return {
@@ -231,15 +269,9 @@ export async function listGoogleMeetCalendarEvents(params: {
   };
 }
 
-export async function findGoogleMeetCalendarEvent(params: {
-  accessToken: string;
-  calendarId?: string;
-  eventQuery?: string;
-  timeMin?: string;
-  timeMax?: string;
-  maxResults?: number;
-  now?: Date;
-}): Promise<GoogleMeetCalendarLookupResult> {
+export async function findGoogleMeetCalendarEvent(
+  params: GoogleMeetCalendarQuery,
+): Promise<GoogleMeetCalendarLookupResult> {
   const result = await listGoogleMeetCalendarEvents(params);
   const selected = result.events.find((event) => event.selected) ?? result.events[0];
   if (!selected) {

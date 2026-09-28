@@ -1,32 +1,38 @@
-/**
- * Shared built-in tool contracts and helpers.
- *
- * Defines erased tool types, parameter readers, JSON results, progress blocks, and media sanitization.
- */
 import { detectMime } from "@openclaw/media-core/mime";
 import {
   asPositiveSafeInteger,
   asSafeIntegerInRange,
   parseStrictFiniteNumber,
 } from "@openclaw/normalization-core/number-coercion";
-import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { asNonArrayRecord } from "@openclaw/normalization-core/record-coerce";
+import { normalizeSingleOrTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import type { TSchema } from "typebox";
-import { readLocalFileSafely } from "../../infra/fs-safe.js";
-import { readSnakeCaseParamRaw } from "../../param-key.js";
-import type { ImageSanitizationLimits } from "../image-sanitization.js";
 import type {
   AgentTool,
   AgentToolProgress,
   AgentToolResult,
   AgentToolUpdateCallback,
-} from "../runtime/index.js";
-import { sanitizeToolResultImages } from "../tool-images.js";
+} from "../../../packages/agent-core/src/types.js";
+import { readLocalFileSafely } from "../../infra/fs-safe.js";
+import { readSnakeCaseParamRaw } from "../../param-key.js";
+import type { ImageSanitizationLimits } from "../image-sanitization.js";
+import { ToolAuthorizationError, ToolInputError } from "../tool-input-error.js";
+import { textResult } from "./tool-results.js";
+
+export { ToolAuthorizationError, ToolInputError };
+export { jsonResult, textResult } from "./tool-results.js";
 
 export type AgentToolWithMeta<TParameters extends TSchema, TResult> = AgentTool<
   TParameters,
   TResult
 > & {
   displaySummary?: string;
+  /** Keep this tool model-visible; hidden catalog bridges cannot preserve its result contract. */
+  catalogMode?: "direct-only";
+  /** Gateway client capabilities required before this tool can be assembled. */
+  requiredClientCaps?: string[];
+  /** Tool-owned execution and transport wait budget, before any harness completion grace. */
+  getExecutionTimeoutMs?: (args: unknown) => number | undefined;
   prepareBeforeToolCallParams?: (
     params: unknown,
     ctx: { toolCallId?: string; hookContext?: unknown; signal?: AbortSignal },
@@ -44,26 +50,14 @@ type ErasedAgentToolExecute = {
   ): Promise<AgentToolResult<unknown>>;
 };
 
-export type AnyAgentTool = Omit<AgentTool, "execute"> &
-  ErasedAgentToolExecute & {
-    displaySummary?: string;
-    prepareBeforeToolCallParams?: AgentToolWithMeta<
-      TSchema,
-      unknown
-    >["prepareBeforeToolCallParams"];
-    finalizeBeforeToolCallParams?: AgentToolWithMeta<
-      TSchema,
-      unknown
-    >["finalizeBeforeToolCallParams"];
-  };
+export type AnyAgentTool = Omit<AgentToolWithMeta<TSchema, unknown>, "execute"> &
+  ErasedAgentToolExecute;
 
 export function asToolParamsRecord(params: unknown): Record<string, unknown> {
-  return params && typeof params === "object" && !Array.isArray(params)
-    ? (params as Record<string, unknown>)
-    : {};
+  return asNonArrayRecord(params);
 }
 
-export type StringParamOptions = {
+type StringParamOptions = {
   required?: boolean;
   trim?: boolean;
   label?: string;
@@ -74,24 +68,6 @@ export type ActionGate<T extends Record<string, boolean | undefined>> = (
   key: keyof T,
   defaultValue?: boolean,
 ) => boolean;
-
-export class ToolInputError extends Error {
-  readonly status: number = 400;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "ToolInputError";
-  }
-}
-
-export class ToolAuthorizationError extends ToolInputError {
-  override readonly status = 403;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "ToolAuthorizationError";
-  }
-}
 
 export function createActionGate<T extends Record<string, boolean | undefined>>(
   actions: T | undefined,
@@ -105,35 +81,31 @@ export function createActionGate<T extends Record<string, boolean | undefined>>(
   };
 }
 
-function readParamRaw(params: Record<string, unknown>, key: string): unknown {
-  return readSnakeCaseParamRaw(params, key);
+// Models may emit blank defaults for optional numeric fields. Treat them as
+// absent while still rejecting nonblank invalid input.
+function isBlankParamValue(raw: unknown): boolean {
+  return typeof raw === "string" && raw.trim() === "";
 }
 
-export function readStringParam(
+export function readToolStringParam(
   params: Record<string, unknown>,
   key: string,
   options: StringParamOptions & { required: true },
 ): string;
-export function readStringParam(
+export function readToolStringParam(
   params: Record<string, unknown>,
   key: string,
   options?: StringParamOptions,
 ): string | undefined;
-export function readStringParam(
+export function readToolStringParam(
   params: Record<string, unknown>,
   key: string,
   options: StringParamOptions = {},
 ) {
   const { required = false, trim = true, label = key, allowEmpty = false } = options;
-  const raw = readParamRaw(params, key);
-  if (typeof raw !== "string") {
-    if (required) {
-      throw new ToolInputError(`${label} required`);
-    }
-    return undefined;
-  }
-  const value = trim ? raw.trim() : raw;
-  if (!value && !allowEmpty) {
+  const raw = readSnakeCaseParamRaw(params, key);
+  const value = typeof raw === "string" ? (trim ? raw.trim() : raw) : undefined;
+  if (value === undefined || (!value && !allowEmpty)) {
     if (required) {
       throw new ToolInputError(`${label} required`);
     }
@@ -142,12 +114,7 @@ export function readStringParam(
   return value;
 }
 
-/**
- * Normalize tool model override input.
- * - empty/whitespace => undefined
- * - "default" (case-insensitive) => undefined (sentinel: reset/fallback)
- * - otherwise returns trimmed explicit model string
- */
+/** "default" resets a model override to its configured fallback. */
 export function normalizeToolModelOverride(value: string | undefined): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -165,7 +132,7 @@ export function readStringOrNumberParam(
   options: { required?: boolean; label?: string } = {},
 ): string | undefined {
   const { required = false, label = key } = options;
-  const raw = readParamRaw(params, key);
+  const raw = readSnakeCaseParamRaw(params, key);
   if (typeof raw === "number" && Number.isFinite(raw)) {
     return String(raw);
   }
@@ -201,7 +168,7 @@ export function readNumberParam(
     positiveInteger = false,
     nonNegativeInteger = false,
   } = options;
-  const raw = readParamRaw(params, key);
+  const raw = readSnakeCaseParamRaw(params, key);
   let value: number | undefined;
   if (typeof raw === "number" && Number.isFinite(raw)) {
     value = raw;
@@ -241,8 +208,11 @@ export function readPositiveIntegerParam(
     positiveInteger: true,
     strict: true,
   });
-  if (value === undefined && readParamRaw(params, key) != null) {
-    throw new ToolInputError(options.message ?? `${key} must be a positive integer`);
+  if (value === undefined) {
+    const raw = readSnakeCaseParamRaw(params, key);
+    if (raw != null && !isBlankParamValue(raw)) {
+      throw new ToolInputError(options.message ?? `${key} must be a positive integer`);
+    }
   }
   if (value !== undefined && options.max !== undefined && value > options.max) {
     throw new ToolInputError(options.message ?? `${key} must be a positive integer`);
@@ -262,8 +232,11 @@ export function readNonNegativeIntegerParam(
     nonNegativeInteger: true,
     strict: true,
   });
-  if (value === undefined && readParamRaw(params, key) != null) {
-    throw new ToolInputError(options.message ?? `${key} must be a non-negative integer`);
+  if (value === undefined) {
+    const raw = readSnakeCaseParamRaw(params, key);
+    if (raw != null && !isBlankParamValue(raw)) {
+      throw new ToolInputError(options.message ?? `${key} must be a non-negative integer`);
+    }
   }
   if (value !== undefined && options.max !== undefined && value > options.max) {
     throw new ToolInputError(options.message ?? `${key} must be a non-negative integer`);
@@ -286,22 +259,19 @@ export function readFiniteNumberParam(
     strict: true,
   });
   if (value === undefined) {
-    if (readParamRaw(params, key) != null) {
+    const raw = readSnakeCaseParamRaw(params, key);
+    if (raw != null && !isBlankParamValue(raw)) {
       throw new ToolInputError(options.message ?? `${key} must be a finite number`);
     }
     return undefined;
   }
-  if (options.min !== undefined) {
-    const below = options.minExclusive ? value <= options.min : value < options.min;
-    if (below) {
-      throw new ToolInputError(options.message ?? `${key} must be a finite number`);
-    }
-  }
-  if (options.max !== undefined) {
-    const above = options.maxExclusive ? value >= options.max : value > options.max;
-    if (above) {
-      throw new ToolInputError(options.message ?? `${key} must be a finite number`);
-    }
+  if (
+    (options.min !== undefined &&
+      (options.minExclusive ? value <= options.min : value < options.min)) ||
+    (options.max !== undefined &&
+      (options.maxExclusive ? value >= options.max : value > options.max))
+  ) {
+    throw new ToolInputError(options.message ?? `${key} must be a finite number`);
   }
   return value;
 }
@@ -322,26 +292,9 @@ export function readStringArrayParam(
   options: StringParamOptions = {},
 ) {
   const { required = false, label = key } = options;
-  const raw = readParamRaw(params, key);
-  if (Array.isArray(raw)) {
-    const values = normalizeStringEntries(raw.filter((entry) => typeof entry === "string"));
-    if (values.length === 0) {
-      if (required) {
-        throw new ToolInputError(`${label} required`);
-      }
-      return undefined;
-    }
+  const values = normalizeSingleOrTrimmedStringList(readSnakeCaseParamRaw(params, key));
+  if (values.length > 0) {
     return values;
-  }
-  if (typeof raw === "string") {
-    const value = raw.trim();
-    if (!value) {
-      if (required) {
-        throw new ToolInputError(`${label} required`);
-      }
-      return undefined;
-    }
-    return [value];
   }
   if (required) {
     throw new ToolInputError(`${label} required`);
@@ -349,7 +302,7 @@ export function readStringArrayParam(
   return undefined;
 }
 
-export type ReactionParams = {
+type ReactionParams = {
   emoji: string;
   remove: boolean;
   isEmpty: boolean;
@@ -366,7 +319,7 @@ export function readReactionParams(
   const emojiKey = options.emojiKey ?? "emoji";
   const removeKey = options.removeKey ?? "remove";
   const remove = typeof params[removeKey] === "boolean" ? params[removeKey] : false;
-  const emoji = readStringParam(params, emojiKey, {
+  const emoji = readToolStringParam(params, emojiKey, {
     required: true,
     allowEmpty: true,
   });
@@ -376,7 +329,7 @@ export function readReactionParams(
   return { emoji, remove, isEmpty: !emoji };
 }
 
-export function stringifyToolPayload(payload: unknown): string {
+function stringifyToolPayload(payload: unknown): string {
   if (typeof payload === "string") {
     return payload;
   }
@@ -391,18 +344,6 @@ export function stringifyToolPayload(payload: unknown): string {
   return String(payload);
 }
 
-export function textResult<TDetails>(text: string, details: TDetails): AgentToolResult<TDetails> {
-  return {
-    content: [
-      {
-        type: "text",
-        text,
-      },
-    ],
-    details,
-  };
-}
-
 export function failedTextResult<TDetails extends { status: "failed" }>(
   text: string,
   details: TDetails,
@@ -414,13 +355,9 @@ export function payloadTextResult<TDetails>(payload: TDetails): AgentToolResult<
   return textResult(stringifyToolPayload(payload), payload);
 }
 
-export function jsonResult(payload: unknown): AgentToolResult<unknown> {
-  return textResult(JSON.stringify(payload, null, 2), payload);
-}
+type PublicToolProgress = Pick<AgentToolProgress, "text" | "id">;
 
-export type PublicToolProgress = Pick<AgentToolProgress, "text" | "id">;
-
-export function toolProgressResult(progress: PublicToolProgress): AgentToolResult<undefined> {
+function toolProgressResult(progress: PublicToolProgress): AgentToolResult<undefined> {
   return {
     content: [],
     details: undefined,
@@ -435,7 +372,7 @@ export function toolProgressResult(progress: PublicToolProgress): AgentToolResul
 
 // Tool progress is a UI side channel. The model-facing tool result remains in
 // `content`; progress text must already be safe to show in channel previews.
-export function emitToolProgress(
+function emitToolProgress(
   onUpdate: AgentToolUpdateCallback | undefined,
   progress: PublicToolProgress,
 ): void {
@@ -478,7 +415,7 @@ export function scheduleToolProgress(
   return clear;
 }
 
-export async function imageResult(params: {
+async function imageResult(params: {
   label: string;
   path: string;
   base64: string;
@@ -512,6 +449,7 @@ export async function imageResult(params: {
       },
     },
   };
+  const { sanitizeToolResultImages } = await import("../tool-images.runtime.js");
   return await sanitizeToolResultImages(result, params.label, params.imageSanitization);
 }
 
@@ -535,7 +473,7 @@ export async function imageResultFromFile(params: {
   });
 }
 
-export type AvailableTag = {
+type AvailableTag = {
   id?: string;
   name: string;
   moderated?: boolean;
@@ -549,9 +487,6 @@ export type AvailableTag = {
  * Entries that lack a string `name` are silently dropped.
  */
 export function parseAvailableTags(raw: unknown): AvailableTag[] | undefined {
-  if (raw === undefined || raw === null) {
-    return undefined;
-  }
   if (!Array.isArray(raw)) {
     return undefined;
   }
@@ -563,7 +498,7 @@ export function parseAvailableTags(raw: unknown): AvailableTag[] | undefined {
     .map((t) =>
       Object.assign(
         {},
-        t.id !== undefined && typeof t.id === `string` ? { id: t.id } : {},
+        typeof t.id === "string" ? { id: t.id } : {},
         { name: t.name as string },
         typeof t.moderated === `boolean` ? { moderated: t.moderated } : {},
         t.emoji_id === null || typeof t.emoji_id === `string` ? { emoji_id: t.emoji_id } : {},

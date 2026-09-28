@@ -18,10 +18,6 @@ export function hasVerifiedBrowserAuth(req: Request): boolean {
   return (req as BrowserAuthMarkedRequest)[BROWSER_AUTH_VERIFIED_FLAG] === true;
 }
 
-function markVerifiedBrowserAuth(req: Request) {
-  (req as BrowserAuthMarkedRequest)[BROWSER_AUTH_VERIFIED_FLAG] = true;
-}
-
 /** Installs common Browser control-server middleware. */
 export function installBrowserCommonMiddleware(app: Express) {
   app.use((req, res, next) => {
@@ -33,19 +29,16 @@ export function installBrowserCommonMiddleware(app: Express) {
         abort();
       }
     });
-    // Make the signal available to browser route handlers on Node versions
-    // whose IncomingMessage does not already expose a native read-only signal.
-    const requestWithSignal = req as Request & { signal?: AbortSignal };
-    if (!(requestWithSignal.signal instanceof AbortSignal)) {
-      Object.defineProperty(req, "signal", {
-        value: ctrl.signal,
-        configurable: true,
-      });
-    }
+    // Node 24.16+'s native request signal aborts when a POST body finishes.
+    // Browser work follows the client/response lifetime instead.
+    Object.defineProperty(req, "signal", {
+      value: ctrl.signal,
+      configurable: true,
+    });
     next();
   });
-  app.use(express.json({ limit: "1mb" }));
   app.use(browserMutationGuardMiddleware());
+  app.use(express.json({ limit: "1mb" }));
 }
 
 /** Installs optional token/password auth for Browser control-server requests. */
@@ -58,7 +51,7 @@ export function installBrowserAuthMiddleware(
   }
   app.use((req, res, next) => {
     if (isAuthorizedBrowserRequest(req, auth)) {
-      markVerifiedBrowserAuth(req);
+      (req as BrowserAuthMarkedRequest)[BROWSER_AUTH_VERIFIED_FLAG] = true;
       return next();
     }
     res.status(401).send("Unauthorized");

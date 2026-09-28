@@ -1,10 +1,10 @@
-// Qa Lab plugin module implements gateway log sentinel behavior.
 import {
   isRecord,
   normalizeOptionalString as readNonEmptyString,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { readQaMessageFunctionCalls, readQaTranscriptMessages } from "./runtime-transcript.js";
 
-export type GatewayLogSentinelKind =
+type GatewayLogSentinelKind =
   | "plugin-hook-failure"
   | "plugin-contract-error"
   | "direct-reply-self-message"
@@ -13,13 +13,13 @@ export type GatewayLogSentinelKind =
   | "cron-model-allowlist"
   | "live-quota-or-subscription";
 
-export type GatewayLogSentinelVerdict =
+type GatewayLogSentinelVerdict =
   | "product-bug"
   | "qa-harness-bug"
   | "fixture-bug"
   | "environment-blocked";
 
-export type GatewayLogSentinelOwner =
+type GatewayLogSentinelOwner =
   | "plugin"
   | "openclaw-routing"
   | "codex-runtime"
@@ -36,13 +36,13 @@ export type GatewayLogSentinelFinding = {
   text: string;
 };
 
-export type GatewayLogSentinelScanOptions = {
+type GatewayLogSentinelScanOptions = {
   since?: number;
   kinds?: readonly GatewayLogSentinelKind[];
   ignoreKinds?: readonly GatewayLogSentinelKind[];
 };
 
-export type GatewayLogSentinelAssertOptions = GatewayLogSentinelScanOptions & {
+type GatewayLogSentinelAssertOptions = GatewayLogSentinelScanOptions & {
   allowEnvironmentBlocked?: boolean;
 };
 
@@ -144,7 +144,7 @@ function lineNumberForOffset(logs: string, offset: number) {
   return logs.slice(0, offset).split(/\r?\n/u).length;
 }
 
-function extractMessageText(message: Record<string, unknown>) {
+export function extractGatewayMessageText(message: Record<string, unknown>) {
   const rawContent = message.content;
   if (typeof rawContent === "string") {
     return rawContent.trim();
@@ -169,9 +169,13 @@ function extractMessageText(message: Record<string, unknown>) {
       continue;
     }
     const nestedText = readNonEmptyString(block.content);
+    const normalizedType = readNonEmptyString(block.type)?.toLowerCase().replace(/_/g, "");
     if (
       nestedText &&
-      (block.type === "output_text" || block.type === "text" || block.type === "message")
+      (normalizedType === "outputtext" ||
+        normalizedType === "text" ||
+        normalizedType === "message" ||
+        normalizedType === "toolresult")
     ) {
       parts.push(nestedText);
     }
@@ -214,19 +218,10 @@ function extractAssistantToolCalls(message: Record<string, unknown>): GatewayLog
     }
   }
 
-  const rawToolCalls =
-    message.tool_calls ?? message.toolCalls ?? message.function_call ?? message.functionCall;
-  const toolCalls = Array.isArray(rawToolCalls) ? rawToolCalls : rawToolCalls ? [rawToolCalls] : [];
-  for (const call of toolCalls) {
-    if (!isRecord(call)) {
-      continue;
-    }
-    const functionRecord = isRecord(call.function) ? call.function : undefined;
+  for (const call of readQaMessageFunctionCalls(message)) {
     calls.push({
-      name: readNonEmptyString(call.name) ?? readNonEmptyString(functionRecord?.name) ?? "unknown",
-      args: parseJsonArguments(
-        call.arguments ?? functionRecord?.arguments ?? call.input ?? functionRecord?.input ?? null,
-      ),
+      name: call.tool ?? "unknown",
+      args: parseJsonArguments(call.args),
     });
   }
   return calls;
@@ -274,7 +269,7 @@ export function createDirectReplyTranscriptSentinelScanner() {
       if (message.role !== "assistant") {
         return;
       }
-      const text = extractMessageText(message);
+      const text = extractGatewayMessageText(message);
       if (text) {
         lastAssistantText = text;
       }
@@ -289,25 +284,14 @@ export function createDirectReplyTranscriptSentinelScanner() {
   };
 }
 
-function transcriptHasDirectReplySelfMessage(transcriptBytes: string) {
+export function scanDirectReplyTranscriptSentinels(
+  transcriptBytes: string,
+): GatewayLogSentinelFinding[] {
   const scanner = createDirectReplyTranscriptSentinelScanner();
-  for (const line of transcriptBytes.split(/\r?\n/u)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      const message = isRecord(parsed) && isRecord(parsed.message) ? parsed.message : undefined;
-      if (!message || message.role !== "assistant") {
-        continue;
-      }
-      scanner.recordMessage(message);
-    } catch {
-      // Ignore malformed QA transcript rows and keep sentinel scans deterministic.
-    }
+  for (const message of readQaTranscriptMessages(transcriptBytes)) {
+    scanner.recordMessage(message);
   }
-  return scanner.findings().length > 0;
+  return scanner.findings();
 }
 
 export function scanGatewayLogSentinels(
@@ -341,15 +325,6 @@ export function scanGatewayLogSentinels(
     }
   }
   return filterGatewayLogSentinelFindings(findings, options);
-}
-
-export function scanDirectReplyTranscriptSentinels(
-  transcriptBytes: string,
-): GatewayLogSentinelFinding[] {
-  if (!transcriptHasDirectReplySelfMessage(transcriptBytes)) {
-    return [];
-  }
-  return [createDirectReplyFinding()];
 }
 
 export function formatGatewayLogSentinelSummary(findings: readonly GatewayLogSentinelFinding[]) {

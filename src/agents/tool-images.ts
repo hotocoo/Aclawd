@@ -3,8 +3,9 @@
  *
  * Downscales and recompresses oversized base64 image blocks before provider replay.
  */
-import { canonicalizeBase64 } from "@openclaw/media-core/base64";
-import { resolveIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import { canonicalizeBase64, estimateBase64DecodedBytes } from "@openclaw/media-core/base64";
+import { formatByteSize, resolveIntegerOption } from "@openclaw/normalization-core";
+import { toErrorObject } from "../infra/errors.js";
 import type { ImageContent } from "../llm/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
@@ -28,18 +29,32 @@ type ToolContentBlock = AgentToolResult<unknown>["content"][number];
 type ImageContentBlock = Extract<ToolContentBlock, { type: "image" }>;
 type TextContentBlock = Extract<ToolContentBlock, { type: "text" }>;
 
+type ToolImageSanitizationOptions = ImageSanitizationLimits & {
+  verifyDecodability?: boolean;
+};
+
 // Anthropic Messages API rejects oversized images; sanitize here so replayed
 // tool outputs do not break later turns or silent channel replies.
 const MAX_IMAGE_DIMENSION_PX = DEFAULT_IMAGE_MAX_DIMENSION_PX;
 const MAX_IMAGE_BYTES = DEFAULT_IMAGE_MAX_BYTES;
+// Hard cap on decoded input bytes before Buffer.from/resizer allocation. A
+// conservative limit well below demonstrated OOM thresholds, leaving headroom
+// for canonicalization, decode, and image-processing allocations while still
+// permitting legitimate tool-output images.
+const MAX_IMAGE_INPUT_BYTES = 10 * 1024 * 1024;
 const log = createSubsystemLogger("agents/tool-images");
 
+function isImageTypeBlock(block: unknown): block is Record<string, unknown> & { type: "image" } {
+  return (
+    Boolean(block) && typeof block === "object" && (block as { type?: unknown }).type === "image"
+  );
+}
+
 function isImageBlock(block: unknown): block is ImageContentBlock {
-  if (!block || typeof block !== "object") {
+  if (!isImageTypeBlock(block)) {
     return false;
   }
-  const rec = block as Record<string, unknown>;
-  return rec.type === "image" && typeof rec.data === "string" && typeof rec.mimeType === "string";
+  return typeof block.data === "string" && typeof block.mimeType === "string";
 }
 
 function isTextBlock(block: unknown): block is TextContentBlock {
@@ -88,13 +103,12 @@ function imageWithinLimits(
 }
 
 function formatBytesShort(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 1024) {
-    return `${Math.max(0, Math.round(bytes))}B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)}KB`;
-  }
-  return `${(bytes / (1024 * 1024)).toFixed(2)}MB`;
+  return formatByteSize(bytes, {
+    style: "legacy-binary",
+    maxUnit: "mega",
+    separator: "",
+    fractionDigits: (_value, unit) => (unit === "mega" ? 2 : unit === "kilo" ? 1 : 0),
+  });
 }
 
 function fileNameFromPathLike(pathLike: string): string | undefined {
@@ -106,25 +120,23 @@ function fileNameFromPathLike(pathLike: string): string | undefined {
   try {
     const url = new URL(value);
     const candidate = url.pathname.split("/").findLast(Boolean);
-    return candidate && candidate.length > 0 ? candidate : undefined;
+    return candidate;
   } catch {
     // Not a URL; continue with path-like parsing.
   }
 
   const normalized = value.replaceAll("\\", "/");
   const candidate = normalized.split("/").findLast(Boolean);
-  return candidate && candidate.length > 0 ? candidate : undefined;
+  return candidate;
 }
 
 function inferImageFileName(params: {
   block: ImageContentBlock;
   label?: string;
-  mediaPathHint?: string;
 }): string | undefined {
-  const rec = params.block as unknown as Record<string, unknown>;
   const explicitKeys = ["fileName", "filename", "path", "url"] as const;
   for (const key of explicitKeys) {
-    const raw = rec[key];
+    const raw = Reflect.get(params.block, key);
     if (typeof raw !== "string" || raw.trim().length === 0) {
       continue;
     }
@@ -134,15 +146,9 @@ function inferImageFileName(params: {
     }
   }
 
-  if (typeof rec.name === "string" && rec.name.trim().length > 0) {
-    return rec.name.trim();
-  }
-
-  if (params.mediaPathHint) {
-    const candidate = fileNameFromPathLike(params.mediaPathHint);
-    if (candidate) {
-      return candidate;
-    }
+  const name = Reflect.get(params.block, "name");
+  if (typeof name === "string" && name.trim().length > 0) {
+    return name.trim();
   }
 
   if (typeof params.label === "string" && params.label.startsWith("read:")) {
@@ -155,6 +161,17 @@ function inferImageFileName(params: {
   return undefined;
 }
 
+async function verifyImageDecodability(buffer: Buffer): Promise<void> {
+  try {
+    // Rastermill probes only headers; discard a tiny encode to verify full decodability.
+    await resizeToJpeg({ buffer, maxSide: 1, quality: 1, withoutEnlargement: true });
+  } catch (err) {
+    if (!isImageProcessorUnavailableError(err)) {
+      throw err;
+    }
+  }
+}
+
 async function resizeImageBase64IfNeeded(params: {
   base64: string;
   mimeType: string;
@@ -162,6 +179,7 @@ async function resizeImageBase64IfNeeded(params: {
   maxBytes: number;
   label?: string;
   fileName?: string;
+  verifyDecodability?: boolean;
 }): Promise<{
   base64: string;
   mimeType: string;
@@ -170,17 +188,7 @@ async function resizeImageBase64IfNeeded(params: {
   height?: number;
 }> {
   const buf = Buffer.from(params.base64, "base64");
-  const headerMeta = readImageMetadataFromHeader(buf);
-  if (imageWithinLimits(buf, headerMeta, params.maxDimensionPx, params.maxBytes)) {
-    return {
-      base64: params.base64,
-      mimeType: params.mimeType,
-      resized: false,
-      width: headerMeta.width,
-      height: headerMeta.height,
-    };
-  }
-  const meta = headerMeta ?? (await getImageMetadata(buf));
+  const meta = readImageMetadataFromHeader(buf) ?? (await getImageMetadata(buf));
   const width = meta?.width;
   const height = meta?.height;
   const overBytes = buf.byteLength > params.maxBytes;
@@ -188,6 +196,9 @@ async function resizeImageBase64IfNeeded(params: {
   const overDimensions =
     hasDimensions && (width > params.maxDimensionPx || height > params.maxDimensionPx);
   if (imageWithinLimits(buf, meta, params.maxDimensionPx, params.maxBytes)) {
+    if (params.verifyDecodability) {
+      await verifyImageDecodability(buf);
+    }
     return {
       base64: params.base64,
       mimeType: params.mimeType,
@@ -201,7 +212,7 @@ async function resizeImageBase64IfNeeded(params: {
   const sideStart = maxDim > 0 ? Math.min(params.maxDimensionPx, maxDim) : params.maxDimensionPx;
   const sideGrid = buildImageResizeSideGrid(params.maxDimensionPx, sideStart);
 
-  let smallest: { buffer: Buffer; size: number } | null = null;
+  let smallestSize: number | undefined;
   let processorUnavailableError: unknown;
   for (const side of sideGrid) {
     for (const quality of IMAGE_REDUCE_QUALITY_STEPS) {
@@ -220,8 +231,8 @@ async function resizeImageBase64IfNeeded(params: {
         }
         throw err;
       }
-      if (!smallest || out.byteLength < smallest.size) {
-        smallest = { buffer: out, size: out.byteLength };
+      if (smallestSize === undefined || out.byteLength < smallestSize) {
+        smallestSize = out.byteLength;
       }
       if (out.byteLength <= params.maxBytes) {
         const sourcePixels =
@@ -236,7 +247,7 @@ async function resizeImageBase64IfNeeded(params: {
             ? Number((((buf.byteLength - out.byteLength) / buf.byteLength) * 100).toFixed(1))
             : 0;
         log.info(
-          `Image resized to fit limits: ${sourceWithFile} ${formatBytesShort(buf.byteLength)} -> ${formatBytesShort(out.byteLength)} (-${byteReductionPct}%)`,
+          `Image resized to fit limits: ${sourceWithFile} ${formatBytesShort(buf.byteLength)} -> ${formatBytesShort(out.byteLength)} (${byteReductionPct < 0 ? "+" : ""}${-byteReductionPct}%)`,
           {
             label: params.label,
             fileName: params.fileName,
@@ -270,17 +281,15 @@ async function resizeImageBase64IfNeeded(params: {
   }
 
   if (processorUnavailableError) {
-    throw toLintErrorObject(processorUnavailableError, "Non-Error thrown");
+    throw toErrorObject(processorUnavailableError, "Non-Error thrown");
   }
 
-  const best = smallest?.buffer ?? buf;
-  const maxMb = (params.maxBytes / (1024 * 1024)).toFixed(0);
-  const gotMb = (best.byteLength / (1024 * 1024)).toFixed(2);
+  const bestSize = smallestSize ?? buf.byteLength;
   const sourcePixels =
     typeof width === "number" && typeof height === "number" ? `${width}x${height}px` : "unknown";
   const sourceWithFile = params.fileName ? `${params.fileName} ${sourcePixels}` : sourcePixels;
   log.warn(
-    `Image resize failed to fit limits: ${sourceWithFile} best=${formatBytesShort(best.byteLength)} limit=${formatBytesShort(params.maxBytes)}`,
+    `Image resize failed to fit limits: ${sourceWithFile} best=${formatBytesShort(bestSize)} limit=${formatBytesShort(params.maxBytes)}`,
     {
       label: params.label,
       fileName: params.fileName,
@@ -290,18 +299,20 @@ async function resizeImageBase64IfNeeded(params: {
       sourceBytes: buf.byteLength,
       maxDimensionPx: params.maxDimensionPx,
       maxBytes: params.maxBytes,
-      smallestCandidateBytes: best.byteLength,
+      smallestCandidateBytes: bestSize,
       triggerOverBytes: overBytes,
       triggerOverDimensions: overDimensions,
     },
   );
-  throw new Error(`Image could not be reduced below ${maxMb}MB (got ${gotMb}MB)`);
+  throw new Error(
+    `Image could not be reduced below ${formatBytesShort(params.maxBytes)} (got ${formatBytesShort(bestSize)})`,
+  );
 }
 
 export async function sanitizeContentBlocksImages(
   blocks: ToolContentBlock[],
   label: string,
-  opts: ImageSanitizationLimits = {},
+  opts: ToolImageSanitizationOptions = {},
 ): Promise<ToolContentBlock[]> {
   const maxDimensionPx = resolveIntegerOption(opts.maxDimensionPx, MAX_IMAGE_DIMENSION_PX, {
     min: 1,
@@ -310,7 +321,27 @@ export async function sanitizeContentBlocksImages(
   const out: ToolContentBlock[] = [];
   for (const block of blocks) {
     if (!isImageBlock(block)) {
+      if (isImageTypeBlock(block)) {
+        out.push({
+          type: "text",
+          text: `[${label}] omitted image payload: missing data or mimeType`,
+        } satisfies TextContentBlock);
+        continue;
+      }
       out.push(block);
+      continue;
+    }
+
+    // Estimate decoded bytes on the raw payload before trim/canonicalize/decode
+    // so pathological multi-GB base64 cannot force a transient large allocation.
+    // maxBytes is the post-decode resize target; MAX_IMAGE_INPUT_BYTES is a
+    // conservative pre-decode ceiling (10 MiB) far below the 25MP/100MB
+    // processing headroom, so legitimate tool images still decode and resize.
+    if (estimateBase64DecodedBytes(block.data) > MAX_IMAGE_INPUT_BYTES) {
+      out.push({
+        type: "text",
+        text: `[${label}] omitted image payload: image exceeds input size limit (${formatBytesShort(MAX_IMAGE_INPUT_BYTES)})`,
+      } satisfies TextContentBlock);
       continue;
     }
 
@@ -342,6 +373,7 @@ export async function sanitizeContentBlocksImages(
         maxBytes,
         label,
         fileName,
+        verifyDecodability: opts.verifyDecodability,
       });
       out.push({
         ...block,
@@ -378,24 +410,10 @@ export async function sanitizeToolResultImages(
   opts: ImageSanitizationLimits = {},
 ): Promise<AgentToolResult<unknown>> {
   const content = Array.isArray(result.content) ? result.content : [];
-  if (!content.some((b) => isImageBlock(b) || isTextBlock(b))) {
+  if (!content.some((block) => isImageTypeBlock(block) || isTextBlock(block))) {
     return result;
   }
 
   const next = await sanitizeContentBlocksImages(content, label, opts);
   return { ...result, content: next };
-}
-
-function toLintErrorObject(value: unknown, fallbackMessage: string): Error {
-  if (value instanceof Error) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return new Error(value);
-  }
-  const error = new Error(fallbackMessage, { cause: value });
-  if ((typeof value === "object" && value !== null) || typeof value === "function") {
-    Object.assign(error, value);
-  }
-  return error;
 }

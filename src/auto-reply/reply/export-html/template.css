@@ -104,9 +104,9 @@ body {
 
 .sidebar-close {
   display: none;
+  align-items: center;
+  justify-content: center;
   padding: 3px 8px;
-  font-size: 12px;
-  font-family: inherit;
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--dim);
@@ -254,6 +254,17 @@ body {
 .download-json-btn:hover {
   background: var(--hover);
   border-color: var(--borderAccent);
+}
+
+/* Export warnings */
+.export-warning {
+  background: var(--userMsgBg);
+  border: 1px solid var(--warning);
+  border-radius: 4px;
+  color: var(--warning);
+  font-size: 12px;
+  margin-bottom: var(--line-height);
+  padding: var(--line-height);
 }
 
 /* Header */
@@ -1068,7 +1079,7 @@ body {
   }
 
   .sidebar-close {
-    display: block;
+    display: inline-flex;
   }
 
   #content {

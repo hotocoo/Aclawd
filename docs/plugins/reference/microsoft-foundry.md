@@ -1,15 +1,16 @@
 ---
-summary: "Use Microsoft Foundry chat and MAI image deployments from OpenClaw."
+summary: "Adds Microsoft Foundry model provider support to OpenClaw."
 read_when:
   - You are installing, configuring, or auditing the microsoft-foundry plugin
-title: "Microsoft Foundry plugin"
+title: "Microsoft Foundry plugin reference"
 ---
 
-# Microsoft Foundry plugin
+<!-- Generated file. Do not edit by hand.
+Run `pnpm plugins:inventory:gen` to rebuild it. Hand-written text survives only
+between the openclaw-plugin-reference:manual-start and
+openclaw-plugin-reference:manual-end comment markers. -->
 
-Use Microsoft Foundry deployments from OpenClaw with API-key auth or Microsoft
-Entra ID through the Azure CLI. The plugin owns Microsoft Foundry model
-discovery, runtime token refresh, and MAI image generation.
+Adds Microsoft Foundry model provider support to OpenClaw.
 
 ## Distribution
 
@@ -18,7 +19,11 @@ discovery, runtime token refresh, and MAI image generation.
 
 ## Surface
 
-- Model provider: `microsoft-foundry`
+- Providers: `microsoft-foundry`
+- Contracts: `imageGenerationProviders`
+
+<!-- openclaw-plugin-reference:manual-start -->
+
 - Image-generation provider: `microsoft-foundry`
 
 ## Requirements
@@ -73,9 +78,11 @@ name in the request `model` field:
 {
   agents: {
     defaults: {
-      imageGenerationModel: {
-        primary: "microsoft-foundry/<deployment-name>",
-        timeoutMs: 600000,
+      mediaModels: {
+        image: {
+          primary: "microsoft-foundry/<deployment-name>",
+          timeoutMs: 600000,
+        },
       },
     },
   },
@@ -108,3 +115,5 @@ MAI image constraints:
   Foundry deployment through onboarding or add `models.providers.microsoft-foundry.baseUrl`.
 - `supports MAI image deployments only`: the selected image model points at a
   non-MAI deployment. Use a deployed MAI image model for `image_generate`.
+
+<!-- openclaw-plugin-reference:manual-end -->

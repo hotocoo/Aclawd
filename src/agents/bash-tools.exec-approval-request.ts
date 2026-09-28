@@ -7,12 +7,11 @@ import {
   asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
 } from "@openclaw/normalization-core/number-coercion";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalString as parseString,
-} from "@openclaw/normalization-core/string-coerce";
+import { normalizeOptionalString as parseString } from "@openclaw/normalization-core/string-coerce";
+import { isApprovalNotFoundError } from "../infra/approval-errors.js";
 import type {
   ExecApprovalCommandSpan,
+  ExecApprovalUnavailableDecision,
   ExecAsk,
   ExecSecurity,
   SystemRunApprovalPlan,
@@ -20,29 +19,26 @@ import type {
 import { normalizeExecutableToken } from "../infra/exec-wrapper-tokens.js";
 import {
   isShellWrapperExecutable,
-  POSIX_SHELL_WRAPPERS,
+  POSIX_PARSEABLE_SHELL_WRAPPERS,
   resolveShellWrapperTransportArgv,
 } from "../infra/shell-wrapper-resolution.js";
+import { createLazyPromise } from "../shared/lazy-runtime.js";
+import { markToolDecisionRecorded } from "./agent-tools.before-tool-call.decision.js";
 import {
   DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS,
   DEFAULT_APPROVAL_TIMEOUT_MS,
 } from "./bash-tools.exec-runtime.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
-type ExecApprovalCommandSpansRuntime =
-  typeof import("./bash-tools.exec-approval-request.runtime.js");
+const POSIX_COMMAND_HIGHLIGHT_SHELLS: ReadonlySet<string> = POSIX_PARSEABLE_SHELL_WRAPPERS;
 
-let execApprovalCommandSpansRuntimePromise: Promise<ExecApprovalCommandSpansRuntime> | null = null;
-const POSIX_COMMAND_HIGHLIGHT_SHELLS: ReadonlySet<string> = POSIX_SHELL_WRAPPERS;
-
-function loadExecApprovalCommandSpansRuntime(): Promise<ExecApprovalCommandSpansRuntime> {
-  execApprovalCommandSpansRuntimePromise ??=
-    import("./bash-tools.exec-approval-request.runtime.js");
-  return execApprovalCommandSpansRuntimePromise;
-}
+const loadExecApprovalCommandSpansRuntime = createLazyPromise(
+  () => import("./bash-tools.exec-approval-request.runtime.js"),
+  { cacheRejections: true },
+);
 
 /** Gateway payload fields used to register or wait for an exec approval decision. */
-export type RequestExecApprovalDecisionParams = {
+type RequestExecApprovalDecisionParams = {
   id: string;
   command?: string;
   commandArgv?: string[];
@@ -55,51 +51,27 @@ export type RequestExecApprovalDecisionParams = {
   ask: ExecAsk;
   warningText?: string;
   commandSpans?: ExecApprovalCommandSpan[];
+  unavailableDecisions?: readonly ExecApprovalUnavailableDecision[];
   agentId?: string;
   resolvedPath?: string;
   sessionKey?: string;
+  sessionId?: string;
+  runId?: string;
+  toolCallId?: string;
   turnSourceChannel?: string;
   turnSourceTo?: string;
   turnSourceAccountId?: string;
   turnSourceThreadId?: string | number;
+  approvalReviewerDeviceIds?: string[];
   requireDeliveryRoute?: boolean;
   suppressDelivery?: boolean;
+  deliverToApprovalClientsOnly?: boolean;
 };
 
 type ExecApprovalRequestToolParams = RequestExecApprovalDecisionParams & {
   timeoutMs: number;
   twoPhase: true;
 };
-
-function buildExecApprovalRequestToolParams(
-  params: RequestExecApprovalDecisionParams,
-): ExecApprovalRequestToolParams {
-  return {
-    id: params.id,
-    ...(params.command ? { command: params.command } : {}),
-    ...(params.commandArgv ? { commandArgv: params.commandArgv } : {}),
-    systemRunPlan: params.systemRunPlan,
-    env: params.env,
-    cwd: params.cwd,
-    nodeId: params.nodeId,
-    host: params.host,
-    security: params.security,
-    ask: params.ask,
-    warningText: params.warningText,
-    commandSpans: params.commandSpans,
-    agentId: params.agentId,
-    resolvedPath: params.resolvedPath,
-    sessionKey: params.sessionKey,
-    turnSourceChannel: params.turnSourceChannel,
-    turnSourceTo: params.turnSourceTo,
-    turnSourceAccountId: params.turnSourceAccountId,
-    turnSourceThreadId: params.turnSourceThreadId,
-    requireDeliveryRoute: params.requireDeliveryRoute,
-    suppressDelivery: params.suppressDelivery,
-    timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
-    twoPhase: true,
-  };
-}
 
 type ParsedDecision = { present: boolean; value: string | null };
 
@@ -116,10 +88,6 @@ function parseDecision(value: unknown): ParsedDecision {
   return { present: true, value: typeof decision === "string" ? decision : null };
 }
 
-function parseExpiresAtMs(value: unknown): number | undefined {
-  return asDateTimestampMs(value);
-}
-
 function resolveDefaultExecApprovalExpiresAtMs(): number {
   return resolveExpiresAtMsFromDurationMs(DEFAULT_APPROVAL_TIMEOUT_MS) ?? 0;
 }
@@ -131,45 +99,38 @@ export type ExecApprovalRegistration = {
   finalDecision?: string | null;
 };
 
+class ExecApprovalRunAbortedError extends Error {
+  constructor() {
+    super("Exec approval cancelled because its run was aborted");
+    this.name = "ExecApprovalRunAbortedError";
+  }
+}
+
+export function isExecApprovalRunAbortedError(error: unknown): boolean {
+  return error instanceof ExecApprovalRunAbortedError;
+}
+
 /** Registers a two-phase exec approval request with the gateway. */
-export async function registerExecApprovalRequest(
-  params: RequestExecApprovalDecisionParams,
+async function registerExecApprovalRequest(
+  params: ExecApprovalRequestToolParams,
 ): Promise<ExecApprovalRegistration> {
   // Two-phase registration is critical: the ID must be registered server-side
   // before exec returns `approval-pending`, otherwise `/approve` can race and orphan.
   const registrationResult = await callGatewayTool(
     "exec.approval.request",
     { timeoutMs: DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS },
-    buildExecApprovalRequestToolParams(params),
+    params,
     { expectFinal: false },
   );
+  markToolDecisionRecorded();
   const decision = parseDecision(registrationResult);
   const id = parseString(registrationResult?.id) ?? params.id;
   const expiresAtMs =
-    parseExpiresAtMs(registrationResult?.expiresAtMs) ?? resolveDefaultExecApprovalExpiresAtMs();
+    asDateTimestampMs(registrationResult?.expiresAtMs) ?? resolveDefaultExecApprovalExpiresAtMs();
   if (decision.present) {
     return { id, expiresAtMs, finalDecision: decision.value };
   }
   return { id, expiresAtMs };
-}
-
-/** Waits for a registered approval decision, returning null when it expires. */
-export async function waitForExecApprovalDecision(id: string): Promise<string | null> {
-  try {
-    const decisionResult = await callGatewayTool<{ decision: string }>(
-      "exec.approval.waitDecision",
-      { timeoutMs: DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS },
-      { id },
-    );
-    return parseDecision(decisionResult).value;
-  } catch (err) {
-    // Timeout/cleanup path: treat missing/expired as no decision so askFallback applies.
-    const message = normalizeLowercaseStringOrEmpty(String(err));
-    if (message.includes("approval expired or not found")) {
-      return null;
-    }
-    throw err;
-  }
 }
 
 /** Uses a pre-resolved decision or waits for the registered approval id. */
@@ -180,60 +141,38 @@ export async function resolveRegisteredExecApprovalDecision(params: {
   if (params.preResolvedDecision !== undefined) {
     return params.preResolvedDecision ?? null;
   }
-  return await waitForExecApprovalDecision(params.approvalId);
-}
-
-/** Registers an approval request and waits unless the gateway returned a final decision. */
-export async function requestExecApprovalDecision(
-  params: RequestExecApprovalDecisionParams,
-): Promise<string | null> {
-  const registration = await registerExecApprovalRequest(params);
-  if (Object.hasOwn(registration, "finalDecision")) {
-    return registration.finalDecision ?? null;
+  try {
+    const decisionResult = await callGatewayTool<{ decision: string }>(
+      "exec.approval.waitDecision",
+      { timeoutMs: DEFAULT_APPROVAL_REQUEST_TIMEOUT_MS },
+      { id: params.approvalId },
+    );
+    if (
+      decisionResult &&
+      typeof decisionResult === "object" &&
+      (decisionResult as { terminalReason?: unknown }).terminalReason === "run-aborted"
+    ) {
+      throw new ExecApprovalRunAbortedError();
+    }
+    return parseDecision(decisionResult).value;
+  } catch (err) {
+    // Timeout/cleanup path: treat missing/expired as no decision so askFallback applies.
+    if (isApprovalNotFoundError(err)) {
+      return null;
+    }
+    throw err;
   }
-  return await waitForExecApprovalDecision(registration.id);
 }
 
-type HostExecApprovalParams = {
+type HostExecApprovalParams = Omit<
+  RequestExecApprovalDecisionParams,
+  "id" | "cwd" | "deliverToApprovalClientsOnly"
+> & {
   approvalId: string;
-  command?: string;
-  commandArgv?: string[];
-  systemRunPlan?: SystemRunApprovalPlan;
-  env?: Record<string, string>;
   workdir: string | undefined;
-  host: "gateway" | "node";
-  nodeId?: string;
-  security: ExecSecurity;
-  ask: ExecAsk;
-  warningText?: string;
-  commandSpans?: ExecApprovalCommandSpan[];
   commandHighlighting?: boolean;
-  agentId?: string;
-  resolvedPath?: string;
-  sessionKey?: string;
-  turnSourceChannel?: string;
-  turnSourceTo?: string;
-  turnSourceAccountId?: string;
-  turnSourceThreadId?: string | number;
-  requireDeliveryRoute?: boolean;
-  suppressDelivery?: boolean;
+  trigger?: string;
 };
-
-type ExecApprovalRequesterContext = {
-  agentId?: string;
-  sessionKey?: string;
-};
-
-/** Builds requester identity context for an approval payload. */
-export function buildExecApprovalRequesterContext(params: ExecApprovalRequesterContext): {
-  agentId?: string;
-  sessionKey?: string;
-} {
-  return {
-    agentId: params.agentId,
-    sessionKey: params.sessionKey,
-  };
-}
 
 type ExecApprovalTurnSourceContext = {
   turnSourceChannel?: string;
@@ -294,7 +233,7 @@ function shouldSkipGeneratedCommandSpans(params: HostExecApprovalParams): boolea
 
 async function buildHostApprovalDecisionParams(
   params: HostExecApprovalParams,
-): Promise<RequestExecApprovalDecisionParams> {
+): Promise<ExecApprovalRequestToolParams> {
   const commandSpans =
     params.commandHighlighting === true
       ? (params.commandSpans ??
@@ -304,8 +243,8 @@ async function buildHostApprovalDecisionParams(
       : undefined;
   return {
     id: params.approvalId,
-    command: params.command,
-    commandArgv: params.commandArgv,
+    ...(params.command ? { command: params.command } : {}),
+    ...(params.commandArgv ? { commandArgv: params.commandArgv } : {}),
     systemRunPlan: params.systemRunPlan,
     env: params.env,
     cwd: params.workdir,
@@ -315,29 +254,35 @@ async function buildHostApprovalDecisionParams(
     ask: params.ask,
     warningText: params.warningText,
     commandSpans,
-    ...buildExecApprovalRequesterContext({
-      agentId: params.agentId,
-      sessionKey: params.sessionKey,
-    }),
+    ...(params.unavailableDecisions?.length
+      ? { unavailableDecisions: params.unavailableDecisions }
+      : {}),
+    agentId: params.agentId,
+    sessionKey: params.sessionKey,
     resolvedPath: params.resolvedPath,
+    sessionId: params.sessionId,
+    runId: params.runId,
+    toolCallId: params.toolCallId,
     requireDeliveryRoute: params.requireDeliveryRoute,
-    suppressDelivery: params.suppressDelivery,
+    // Gateway-host cron cards go only to connected exec approval clients
+    // (Control UI, macOS/iOS/Android apps, `approvals`/`exec-approvals` cap
+    // holders — not the TUI); allow-always there mints a standing grant that
+    // ends the recurrence. With no client connected, the request still registers and
+    // expires no-route into the headless denial (#128031). Node-host cron has
+    // no grant mint/consume path yet, so it keeps the fully suppressed
+    // headless policy instead of raising cards whose allow-always could not
+    // stick as a scoped grant.
+    suppressDelivery:
+      params.suppressDelivery === true || (params.trigger === "cron" && params.host !== "gateway")
+        ? true
+        : undefined,
+    deliverToApprovalClientsOnly:
+      params.trigger === "cron" && params.host === "gateway" ? true : undefined,
+    approvalReviewerDeviceIds: params.approvalReviewerDeviceIds,
     ...buildExecApprovalTurnSourceContext(params),
+    timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS,
+    twoPhase: true,
   };
-}
-
-/** Requests and waits for an approval decision for host/node exec. */
-export async function requestExecApprovalDecisionForHost(
-  params: HostExecApprovalParams,
-): Promise<string | null> {
-  return await requestExecApprovalDecision(await buildHostApprovalDecisionParams(params));
-}
-
-/** Registers a host/node approval request without waiting for a decision. */
-export async function registerExecApprovalRequestForHost(
-  params: HostExecApprovalParams,
-): Promise<ExecApprovalRegistration> {
-  return await registerExecApprovalRequest(await buildHostApprovalDecisionParams(params));
 }
 
 /** Registers a host/node approval request and wraps failures for exec callers. */
@@ -345,7 +290,7 @@ export async function registerExecApprovalRequestForHostOrThrow(
   params: HostExecApprovalParams,
 ): Promise<ExecApprovalRegistration> {
   try {
-    return await registerExecApprovalRequestForHost(params);
+    return await registerExecApprovalRequest(await buildHostApprovalDecisionParams(params));
   } catch (err) {
     throw new Error(`Exec approval registration failed: ${String(err)}`, { cause: err });
   }

@@ -1,13 +1,16 @@
 ---
-summary: "Adds file-backed memory search tools."
+summary: "Adds agent-callable tools."
 read_when:
   - You are installing, configuring, or auditing the memory-core plugin
-title: "Memory Core plugin"
+title: "Memory Core plugin reference"
 ---
 
-# Memory Core plugin
+<!-- Generated file. Do not edit by hand.
+Run `pnpm plugins:inventory:gen` to rebuild it. Hand-written text survives only
+between the openclaw-plugin-reference:manual-start and
+openclaw-plugin-reference:manual-end comment markers. -->
 
-Adds file-backed memory search tools.
+Adds agent-callable tools.
 
 ## Distribution
 
@@ -16,4 +19,6 @@ Adds file-backed memory search tools.
 
 ## Surface
 
-contracts: tools
+- CLI commands: `openclaw memory`
+- Slash commands: `/dreaming`
+- Contracts: `tools`

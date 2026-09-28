@@ -4,12 +4,11 @@ import type { OpenClawConfig } from "../config/types.js";
 import {
   parseLiveCsvFilter,
   parseProviderModelMap,
-  redactLiveApiKey,
   resolveConfiguredLiveProviderModels,
   resolveLiveAuthStore,
 } from "../media-generation/live-test-helpers.js";
 
-export { parseProviderModelMap, redactLiveApiKey };
+export { parseProviderModelMap };
 
 // Default provider/model matrix for video live tests. Env/config filters can
 // override this without editing the live test source.
@@ -20,7 +19,6 @@ export const DEFAULT_LIVE_VIDEO_MODELS: Record<string, string> = {
   fal: "fal/fal-ai/minimax/video-01-live",
   google: "google/veo-3.1-fast-generate-preview",
   minimax: "minimax/MiniMax-Hailuo-2.3",
-  openai: "openai/sora-2",
   openrouter: "openrouter/google/veo-3.1-fast",
   pixverse: "pixverse/v6",
   qwen: "qwen/wan2.6-t2v",
@@ -30,7 +28,7 @@ export const DEFAULT_LIVE_VIDEO_MODELS: Record<string, string> = {
   xai: "xai/grok-imagine-video",
 };
 
-const REMOTE_URL_VIDEO_TO_VIDEO_PROVIDERS = new Set(["alibaba", "google", "openai", "qwen", "xai"]);
+const REMOTE_URL_VIDEO_TO_VIDEO_PROVIDERS = new Set(["alibaba", "google", "qwen", "xai"]);
 const BUFFER_BACKED_IMAGE_TO_VIDEO_UNSUPPORTED_PROVIDERS = new Set(["vydra"]);
 const TOGETHER_BUFFER_BACKED_IMAGE_TO_VIDEO_MODEL = "Wan-AI/Wan2.2-I2V-A14B";
 
@@ -50,15 +48,18 @@ export function resolveLiveVideoResolution(params: {
   if (providerId === "pixverse") {
     return "540P";
   }
+  if (providerId === "alibaba" || providerId === "qwen") {
+    return "720P";
+  }
   return "480P";
 }
 
-export function parseCsvFilter(raw?: string): Set<string> | null {
+export function parseVideoProviderFilter(raw?: string): Set<string> | null {
   return parseLiveCsvFilter(raw);
 }
 
 export function resolveConfiguredLiveVideoModels(cfg: OpenClawConfig): Map<string, string> {
-  return resolveConfiguredLiveProviderModels(cfg.agents?.defaults?.videoGenerationModel);
+  return resolveConfiguredLiveProviderModels(cfg.agents?.defaults?.mediaModels?.video);
 }
 
 export function canRunBufferBackedVideoToVideoLiveLane(params: {

@@ -1,21 +1,12 @@
-/**
- * Computes run timeout behavior while compaction is in progress.
- */
 import type { AgentMessage } from "../../runtime/index.js";
 
-/** Timeout state used to distinguish normal run deadlines from compaction stalls. */
-export type CompactionTimeoutSignal = {
+/** Flags only run-timeout events that overlap pending, retrying, or active compaction work. */
+export function shouldFlagCompactionTimeout(signal: {
   isTimeout: boolean;
   isCompactionPendingOrRetrying: boolean;
   isCompactionInFlight: boolean;
-};
-
-/** Flags only run-timeout events that overlap pending, retrying, or active compaction work. */
-export function shouldFlagCompactionTimeout(signal: CompactionTimeoutSignal): boolean {
-  if (!signal.isTimeout) {
-    return false;
-  }
-  return signal.isCompactionPendingOrRetrying || signal.isCompactionInFlight;
+}): boolean {
+  return signal.isTimeout && (signal.isCompactionPendingOrRetrying || signal.isCompactionInFlight);
 }
 
 /**
@@ -34,40 +25,25 @@ export function resolveRunTimeoutDuringCompaction(params: {
   return params.graceAlreadyUsed ? "abort" : "extend";
 }
 
-/** Effective run timeout after adding the one-time compaction grace budget. */
-export function resolveRunTimeoutWithCompactionGraceMs(params: {
-  runTimeoutMs: number;
-  compactionTimeoutMs: number;
-}): number {
-  return params.runTimeoutMs + params.compactionTimeoutMs;
-}
-
-/** Candidate transcript snapshots available when a timeout fires during compaction. */
-export type SnapshotSelectionParams = {
-  timedOutDuringCompaction: boolean;
-  preCompactionSnapshot: AgentMessage[] | null;
-  preCompactionSessionId: string;
-  currentSnapshot: AgentMessage[];
-  currentSessionId: string;
-};
-
 /** Snapshot chosen for retry/replay after a compaction-related timeout. */
-export type SnapshotSelection = {
+type SnapshotSelection = {
   messagesSnapshot: AgentMessage[];
   sessionIdUsed: string;
   source: "pre-compaction" | "current";
 };
 
-function canContinueFromMessage(message: AgentMessage | undefined): boolean {
-  switch (message?.role) {
+export function canContinueFromMessage(message: AgentMessage | undefined): boolean {
+  if (!message || ("excludeFromContext" in message && message.excludeFromContext === true)) {
+    return false;
+  }
+  switch (message.role) {
     case "user":
     case "toolResult":
     case "branchSummary":
     case "compactionSummary":
     case "custom":
-      return true;
     case "bashExecution":
-      return message.excludeFromContext !== true;
+      return true;
     default:
       return false;
   }
@@ -76,7 +52,7 @@ function canContinueFromMessage(message: AgentMessage | undefined): boolean {
 // Drop trailing assistant/tool-call-only fragments before retrying. Those tails
 // are not safe continuation points because replay could resume after an
 // incomplete action instead of a user, tool-result, or summary boundary.
-function trimToContinuableTail(messages: AgentMessage[]): AgentMessage[] | null {
+export function trimToContinuableTail(messages: AgentMessage[]): AgentMessage[] | null {
   let end = messages.length;
   while (end > 0 && !canContinueFromMessage(messages[end - 1])) {
     end -= 1;
@@ -89,9 +65,13 @@ function trimToContinuableTail(messages: AgentMessage[]): AgentMessage[] | null 
  * pre-compaction view when it can be continued cleanly; otherwise fall back to a
  * trimmed current snapshot so retry does not replay past an unsafe tail.
  */
-export function selectCompactionTimeoutSnapshot(
-  params: SnapshotSelectionParams,
-): SnapshotSelection {
+export function selectCompactionTimeoutSnapshot(params: {
+  timedOutDuringCompaction: boolean;
+  preCompactionSnapshot: AgentMessage[] | null;
+  preCompactionSessionId: string;
+  currentSnapshot: AgentMessage[];
+  currentSessionId: string;
+}): SnapshotSelection {
   if (!params.timedOutDuringCompaction) {
     return {
       messagesSnapshot: params.currentSnapshot,
@@ -111,17 +91,8 @@ export function selectCompactionTimeoutSnapshot(
     }
   }
 
-  const continuableCurrentSnapshot = trimToContinuableTail(params.currentSnapshot);
-  if (continuableCurrentSnapshot) {
-    return {
-      messagesSnapshot: continuableCurrentSnapshot,
-      sessionIdUsed: params.currentSessionId,
-      source: "current",
-    };
-  }
-
   return {
-    messagesSnapshot: [],
+    messagesSnapshot: trimToContinuableTail(params.currentSnapshot) ?? [],
     sessionIdUsed: params.currentSessionId,
     source: "current",
   };

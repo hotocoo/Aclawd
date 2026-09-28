@@ -1,7 +1,8 @@
 // Measures plugin lifecycle matrix E2E command timings.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { reportLimitViolations } from "../../../lib/check-limits.mts";
 
 const [summaryPath, phase, separator, command, ...args] = process.argv.slice(2);
 if (!summaryPath || !phase || separator !== "--" || !command) {
@@ -21,6 +22,21 @@ function readPositiveIntEnv(name, fallback) {
   return value;
 }
 
+function readPositiveIntEnvOrGetconf(name, variable) {
+  if (process.env[name] !== undefined) {
+    return readPositiveIntEnv(name, "");
+  }
+  const result = spawnSync("getconf", [variable], { encoding: "utf8" });
+  if (result.error || result.status !== 0) {
+    const details =
+      result.error?.message || result.stderr.trim() || `exit ${String(result.status)}`;
+    throw new Error(
+      `failed to derive ${name} from getconf ${variable}: ${details}; set ${name} explicitly`,
+    );
+  }
+  return readPositiveIntEnv(name, result.stdout);
+}
+
 function readPositiveNumberEnv(name, fallback) {
   const text = String(process.env[name] ?? fallback).trim();
   if (!/^\d+(?:\.\d+)?$/u.test(text)) {
@@ -33,13 +49,20 @@ function readPositiveNumberEnv(name, fallback) {
   return value;
 }
 
-const pageSize = readPositiveIntEnv("OPENCLAW_PROC_PAGE_SIZE", 4096);
-const clockTicks = readPositiveIntEnv("OPENCLAW_PROC_CLK_TCK", 100);
-const pollMs = readPositiveIntEnv("OPENCLAW_PLUGIN_LIFECYCLE_METRIC_POLL_MS", 100);
-const timeoutMs = readPositiveIntEnv("OPENCLAW_PLUGIN_LIFECYCLE_PHASE_TIMEOUT_MS", 300000);
-const timeoutKillGraceMs = readPositiveIntEnv(
-  "OPENCLAW_PLUGIN_LIFECYCLE_TIMEOUT_KILL_GRACE_MS",
-  2000,
+const MAX_TIMER_TIMEOUT_MS = 2_147_000_000;
+
+function clampPluginLifecycleTimerMs(valueMs) {
+  return Math.min(Math.max(Math.floor(valueMs), 1), MAX_TIMER_TIMEOUT_MS);
+}
+
+const pollMs = clampPluginLifecycleTimerMs(
+  readPositiveIntEnv("OPENCLAW_PLUGIN_LIFECYCLE_METRIC_POLL_MS", 100),
+);
+const timeoutMs = clampPluginLifecycleTimerMs(
+  readPositiveIntEnv("OPENCLAW_PLUGIN_LIFECYCLE_PHASE_TIMEOUT_MS", 300000),
+);
+const timeoutKillGraceMs = clampPluginLifecycleTimerMs(
+  readPositiveIntEnv("OPENCLAW_PLUGIN_LIFECYCLE_TIMEOUT_KILL_GRACE_MS", 2000),
 );
 const maxRssKbThreshold = readPositiveIntEnv(
   "OPENCLAW_PLUGIN_LIFECYCLE_MAX_RSS_KB",
@@ -53,14 +76,20 @@ if (!fs.existsSync("/proc")) {
   process.exit(2);
 }
 
+// /proc RSS is in host pages and CPU times are in host clock ticks. Query the
+// live units so 64 KiB ARM kernels do not under-report resource use.
+const pageSize = readPositiveIntEnvOrGetconf("OPENCLAW_PROC_PAGE_SIZE", "PAGESIZE");
+const clockTicks = readPositiveIntEnvOrGetconf("OPENCLAW_PROC_CLK_TCK", "CLK_TCK");
+
 function readProcSnapshot() {
   const stats = new Map();
-  for (const entry of fs.readdirSync("/proc", { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) {
+  // Dirent resolution can lstat a process that exits during enumeration.
+  for (const entry of fs.readdirSync("/proc")) {
+    if (!/^\d+$/u.test(entry)) {
       continue;
     }
-    const pid = Number.parseInt(entry.name, 10);
-    const statPath = path.join("/proc", entry.name, "stat");
+    const pid = Number.parseInt(entry, 10);
+    const statPath = path.join("/proc", entry, "stat");
     try {
       const raw = fs.readFileSync(statPath, "utf8");
       const closeParen = raw.lastIndexOf(")");
@@ -72,11 +101,13 @@ function readProcSnapshot() {
         .trim()
         .split(/\s+/u);
       const ppid = Number.parseInt(fields[1] ?? "", 10);
+      const pgrp = Number.parseInt(fields[2] ?? "", 10);
       const userTicks = Number.parseInt(fields[11] ?? "", 10);
       const systemTicks = Number.parseInt(fields[12] ?? "", 10);
       const rssPages = Number.parseInt(fields[21] ?? "", 10);
       if (
         !Number.isFinite(ppid) ||
+        !Number.isFinite(pgrp) ||
         !Number.isFinite(userTicks) ||
         !Number.isFinite(systemTicks) ||
         !Number.isFinite(rssPages)
@@ -85,6 +116,7 @@ function readProcSnapshot() {
       }
       stats.set(pid, {
         ppid,
+        pgrp,
         cpuTicks: userTicks + systemTicks,
         rssBytes: Math.max(0, rssPages) * pageSize,
       });
@@ -117,7 +149,10 @@ function descendantsOf(rootPid, stats) {
 
 function sample(rootPid) {
   const stats = readProcSnapshot();
-  const pids = descendantsOf(rootPid, stats);
+  const groupPids = new Set(
+    [...stats.entries()].filter(([, stat]) => stat.pgrp === rootPid).map(([pid]) => pid),
+  );
+  const pids = new Set([...descendantsOf(rootPid, stats), ...groupPids]);
   let rssBytes = 0;
   let cpuTicks = 0;
   for (const pid of pids) {
@@ -148,6 +183,11 @@ let forwardedParentSignal = null;
 let killTimer;
 let parentSignalTimer;
 let parentSignalPollTimer;
+let parentSignalDeadline = null;
+let childGroupDrainTimer;
+// The leader can exit before descendants in its detached process group.
+// Keep the wrapper alive so timeout cleanup still owns those descendants.
+let childClosedResult = null;
 const updateMetrics = () => {
   if (!child.pid) {
     return;
@@ -157,11 +197,27 @@ const updateMetrics = () => {
   maxCpuTicks = Math.max(maxCpuTicks, current.cpuTicks);
 };
 
+function finishChildClosedResultIfGroupDrained() {
+  if (childClosedResult && !childGroupExists()) {
+    finish(childClosedResult.code, childClosedResult.signal);
+  }
+}
+
+// Child readiness can become externally visible before the initial /proc scan.
+// Install handlers first so early parent termination still reaches the detached group.
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.once(signal, () => handleParentSignal(signal));
+}
+
 updateMetrics();
 const interval = setInterval(updateMetrics, pollMs);
 const timeoutTimer =
   Number.isFinite(timeoutMs) && timeoutMs > 0
     ? setTimeout(() => {
+        if (childClosedResult && !childGroupExists()) {
+          finish(childClosedResult.code, childClosedResult.signal);
+          return;
+        }
         timedOut = true;
         terminateChildGroup("SIGTERM");
         killTimer = setTimeout(() => {
@@ -215,10 +271,23 @@ function clearRuntimeTimers() {
   if (parentSignalPollTimer) {
     clearInterval(parentSignalPollTimer);
   }
+  if (childGroupDrainTimer) {
+    clearInterval(childGroupDrainTimer);
+  }
 }
 
-function rethrowParentSignal(signal) {
+function rethrowParentSignal(signal, reason) {
+  const exitedAt = performance.now();
   clearRuntimeTimers();
+  // Flush the exit decision before rethrowing a signal can discard buffered output.
+  try {
+    fs.writeSync(
+      2,
+      `plugin lifecycle termination: phase=${phase} reason=${reason} signal=${signal} exit_ms=${exitedAt} grace_deadline_ms=${parentSignalDeadline}\n`,
+    );
+  } catch {
+    // Closed stderr must not prevent propagation of the original signal.
+  }
   process.removeAllListeners(signal);
   process.kill(process.pid, signal);
   process.exit(128);
@@ -227,34 +296,31 @@ function rethrowParentSignal(signal) {
 function handleParentSignal(signal) {
   if (parentSignalInFlight) {
     terminateChildGroup("SIGKILL");
-    rethrowParentSignal(signal);
+    rethrowParentSignal(signal, "signalled");
     return;
   }
   parentSignalInFlight = true;
   if (finished) {
-    rethrowParentSignal(signal);
+    rethrowParentSignal(signal, "signalled");
     return;
   }
   finished = true;
   forwardedParentSignal = signal;
   clearRuntimeTimers();
   terminateChildGroup(signal);
+  parentSignalDeadline = performance.now() + timeoutKillGraceMs;
   parentSignalTimer = setTimeout(() => {
     terminateChildGroup("SIGKILL");
-    rethrowParentSignal(signal);
+    rethrowParentSignal(signal, "grace-elapsed");
   }, timeoutKillGraceMs);
   parentSignalPollTimer = setInterval(
     () => {
       if (!childGroupExists()) {
-        rethrowParentSignal(signal);
+        rethrowParentSignal(signal, "descendants-drained");
       }
     },
     Math.min(50, timeoutKillGraceMs),
   );
-}
-
-for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
-  process.once(signal, () => handleParentSignal(signal));
 }
 
 process.once("exit", () => {
@@ -292,7 +358,14 @@ function finish(code, signal) {
   if (cpuCoreRatio > maxCpuCoreRatio) {
     violations.push(`cpu_core_ratio=${cpuCoreRatio.toFixed(3)} > ${maxCpuCoreRatio}`);
   }
-  if (violations.length > 0) {
+  const limitsFailed = reportLimitViolations(
+    violations.map((message) => ({
+      file: "scripts/e2e/lib/plugin-lifecycle-matrix/measure.mjs",
+      title: "Plugin lifecycle resource budget",
+      message: `phase=${phase} ${message}`,
+    })),
+  );
+  if (limitsFailed) {
     console.error(
       `plugin lifecycle resource ceiling exceeded: phase=${phase} ${violations.join("; ")}`,
     );
@@ -322,11 +395,16 @@ child.on("error", (error) => {
 child.on("exit", (code, signal) => {
   if (parentSignalInFlight && forwardedParentSignal) {
     if (!childGroupExists()) {
-      rethrowParentSignal(forwardedParentSignal);
+      rethrowParentSignal(forwardedParentSignal, "descendants-drained");
     }
     return;
   }
   if (timedOut && killTimer) {
+    return;
+  }
+  if (childGroupExists()) {
+    childClosedResult = { code, signal };
+    childGroupDrainTimer = setInterval(finishChildClosedResultIfGroupDrained, Math.min(25, pollMs));
     return;
   }
   finish(code, signal);

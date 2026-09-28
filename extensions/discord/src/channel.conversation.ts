@@ -1,4 +1,3 @@
-// Discord plugin module implements channel.conversation behavior.
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalStringifiedId,
@@ -73,15 +72,7 @@ function resolveDiscordConversationIdFromTargets(
       if (target?.normalized) {
         return target.normalized;
       }
-    } catch {
-      const mentionMatch = trimmed.match(/^<#(\d+)>$/);
-      if (mentionMatch?.[1]) {
-        return `channel:${mentionMatch[1]}`;
-      }
-      if (/^\d{6,}$/.test(trimmed)) {
-        return normalizeDiscordMessagingTarget(trimmed);
-      }
-    }
+    } catch {}
   }
   return undefined;
 }
@@ -119,7 +110,7 @@ export function resolveDiscordCommandConversation(params: {
   return conversationId ? { conversationId } : null;
 }
 
-export function resolveDiscordThreadConversationRef(params: {
+function resolveDiscordThreadConversationRef(params: {
   threadId?: string | number | null;
   threadParentId?: string | number | null;
   parentSessionKey?: string | null;

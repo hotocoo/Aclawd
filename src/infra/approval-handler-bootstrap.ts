@@ -4,6 +4,8 @@ import type { ChannelRuntimeSurface } from "../channels/plugins/channel-runtime-
 import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { withGatewayNativeApprovalRuntime } from "./approval-gateway-runtime-context.js";
+import type { GatewayNativeApprovalRuntime } from "./approval-gateway-runtime.types.js";
 import {
   CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
   createChannelApprovalHandlerFromCapability,
@@ -15,7 +17,6 @@ import {
 } from "./channel-runtime-context.js";
 import { isExecApprovalChannelRuntimeTerminalStartError } from "./exec-approval-channel-runtime.js";
 
-type ApprovalBootstrapHandler = ChannelApprovalHandler;
 const APPROVAL_HANDLER_BOOTSTRAP_RETRY_MS = 1_000;
 
 function isRetryableApprovalBootstrapStartError(error: unknown): boolean {
@@ -46,6 +47,7 @@ export async function startChannelApprovalHandlerBootstrap(params: {
   cfg: OpenClawConfig;
   accountId: string;
   channelRuntime?: ChannelRuntimeSurface;
+  gatewayRuntime?: GatewayNativeApprovalRuntime;
   logger?: ReturnType<typeof createSubsystemLogger>;
 }): Promise<() => Promise<void>> {
   const capability = resolveChannelApprovalCapability(params.plugin);
@@ -56,7 +58,7 @@ export async function startChannelApprovalHandlerBootstrap(params: {
   const channelLabel = params.plugin.meta.label || params.plugin.id;
   const logger = params.logger ?? createSubsystemLogger(`${params.plugin.id}/approval-bootstrap`);
   let activeGeneration = 0;
-  let activeHandler: ApprovalBootstrapHandler | null = null;
+  let activeHandler: ChannelApprovalHandler | null = null;
   let retryTimer: NodeJS.Timeout | null = null;
   const invalidateActiveHandler = () => {
     activeGeneration += 1;
@@ -86,16 +88,18 @@ export async function startChannelApprovalHandlerBootstrap(params: {
     if (generation !== activeGeneration) {
       return;
     }
-    const handler = await createChannelApprovalHandlerFromCapability({
-      capability,
-      label: `${params.plugin.id}/native-approvals`,
-      clientDisplayName: `${channelLabel} Native Approvals (${params.accountId})`,
-      channel: params.plugin.id,
-      channelLabel,
-      cfg: params.cfg,
-      accountId: params.accountId,
-      context,
-    });
+    const handler = await withGatewayNativeApprovalRuntime(params.gatewayRuntime, () =>
+      createChannelApprovalHandlerFromCapability({
+        capability,
+        label: `${params.plugin.id}/native-approvals`,
+        clientDisplayName: `${channelLabel} Native Approvals (${params.accountId})`,
+        channel: params.plugin.id,
+        channelLabel,
+        cfg: params.cfg,
+        accountId: params.accountId,
+        context,
+      }),
+    );
     if (!handler) {
       return;
     }
@@ -104,9 +108,9 @@ export async function startChannelApprovalHandlerBootstrap(params: {
       await handler.stop().catch(() => {});
       return;
     }
-    activeHandler = handler as ApprovalBootstrapHandler;
+    activeHandler = handler;
     try {
-      await handler.start();
+      await withGatewayNativeApprovalRuntime(params.gatewayRuntime, () => handler.start());
     } catch (error) {
       if (activeHandler === handler) {
         activeHandler = null;
