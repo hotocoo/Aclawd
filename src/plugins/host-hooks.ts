@@ -129,6 +129,16 @@ export type PluginSessionActionContext = {
   client?: {
     connId?: string;
     scopes: string[];
+    /**
+     * Live check: whether the caller's current operator role allows this agent.
+     * Re-evaluated on every call, so check it right before reading agent data.
+     */
+    allowsAgent?: (agentId: string) => boolean;
+    /**
+     * Live check: whether several people currently share this Gateway, so admin
+     * scope distinguishes the owner. Re-evaluated on every call.
+     */
+    isSharedGateway?: () => boolean;
   };
 };
 
@@ -175,6 +185,8 @@ export type PluginAgentEventSubscriptionRegistration = {
   id: string;
   description?: string;
   streams?: AgentEventStream[];
+  phases?: string[];
+  payload?: "full" | "metadata";
   handle: (
     event: AgentEventPayload,
     ctx: {
@@ -346,13 +358,7 @@ export function normalizeHostHookString(value: unknown): string {
 }
 
 export function normalizeOptionalHostHookString(value: unknown): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "string") {
-    return "";
-  }
-  return value.trim();
+  return value === undefined ? undefined : normalizeHostHookString(value);
 }
 
 export function normalizeHostHookStringList(value: unknown): string[] | undefined | null {

@@ -1,3 +1,4 @@
+import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeControlUiBasePath } from "./grammar.js";
 
 const FOCUS_SEGMENT = "/focus";
@@ -55,27 +56,6 @@ function normalizePathname(pathname: string): string {
   return withSlash.length > 1 ? withSlash.replace(/\/+$/u, "") : withSlash;
 }
 
-function splitPathSuffix(value: string): { pathname: string; suffix: string } {
-  const queryIndex = value.indexOf("?");
-  const hashIndex = value.indexOf("#");
-  const suffixIndex = [queryIndex, hashIndex]
-    .filter((index) => index >= 0)
-    .reduce((first, index) => Math.min(first, index), value.length);
-  return { pathname: value.slice(0, suffixIndex), suffix: value.slice(suffixIndex) };
-}
-
-function nonEmptyValue(value: string | null | undefined): string | null {
-  return value && value.trim() ? value : null;
-}
-
-function decodeFocusValue(segment: string): { ok: true; value: string | null } | { ok: false } {
-  try {
-    return { ok: true, value: nonEmptyValue(decodeURIComponent(segment)) };
-  } catch {
-    return { ok: false };
-  }
-}
-
 function parseBrowserFocus(search: string): ControlUiFocusBrowserTarget | null {
   const query = new URLSearchParams(search);
   const value = (key: string): string | null => {
@@ -126,14 +106,7 @@ export function inferControlUiFocusBasePath(pathname: string): string | null {
         (rest[selectorIndex] === "source" || rest[selectorIndex] === "session"))
     );
   };
-  let focusIndex = focusIndexes.at(-1) ?? 0;
-  for (let index = focusIndexes.length - 1; index >= 0; index -= 1) {
-    const candidate = focusIndexes[index];
-    if (candidate !== undefined && supportsSuffix(candidate)) {
-      focusIndex = candidate;
-      break;
-    }
-  }
+  const focusIndex = focusIndexes.findLast(supportsSuffix) ?? focusIndexes.at(-1) ?? 0;
   return normalizeControlUiBasePath(segments.slice(0, focusIndex).join("/"));
 }
 
@@ -176,8 +149,8 @@ export function buildControlUiFocusPath(
   }
   if (target.kind === "desktop") {
     const control = target.control === true ? "/control" : "";
-    const source = nonEmptyValue(target.source);
-    const session = nonEmptyValue(target.session);
+    const source = readNonBlankString(target.source);
+    const session = readNonBlankString(target.session);
     const selector = source
       ? `/source/${encodeURIComponent(source)}`
       : session
@@ -185,7 +158,11 @@ export function buildControlUiFocusPath(
         : "";
     return `${root}/desktop${control}${selector}`;
   }
-  const { pathname, suffix } = splitPathSuffix(target.path);
+  const path = target.path;
+  const delimiter = path.search(/[?#]/u);
+  const suffixIndex = delimiter < 0 ? path.length : delimiter;
+  const pathname = path.slice(0, suffixIndex);
+  const suffix = path.slice(suffixIndex);
   const normalizedPath = normalizePathname(pathname);
   const dashboardRoot = `${base}/dashboard/`;
   if (!normalizedPath.startsWith(dashboardRoot)) {
@@ -240,40 +217,30 @@ export function parseControlUiFocusLocation(
   if (control) {
     index += 1;
   }
-  if (segments.length === index) {
-    return {
-      status: "valid",
-      basePath: resolvedBasePath,
-      target: { kind: "desktop", control, selector: null },
-    };
-  }
-  const selectorKind = segments[index];
-  const encodedValue = segments[index + 1];
-  if (
-    segments.length !== index + 2 ||
-    (selectorKind !== "source" && selectorKind !== "session") ||
-    encodedValue === undefined
-  ) {
-    return { status: "unsupported", basePath: resolvedBasePath };
-  }
-  const decoded = decodeFocusValue(encodedValue);
-  if (!decoded.ok) {
-    return { status: "unsupported", basePath: resolvedBasePath };
-  }
-  if (!decoded.value) {
-    return {
-      status: "valid",
-      basePath: resolvedBasePath,
-      target: { kind: "desktop", control, selector: null },
-    };
+  let selector: Extract<ControlUiFocusTarget, { kind: "desktop" }>["selector"] = null;
+  if (segments.length !== index) {
+    const selectorKind = segments[index];
+    const encodedValue = segments[index + 1];
+    if (
+      segments.length !== index + 2 ||
+      (selectorKind !== "source" && selectorKind !== "session") ||
+      encodedValue === undefined
+    ) {
+      return { status: "unsupported", basePath: resolvedBasePath };
+    }
+    let value: string | null;
+    try {
+      value = readNonBlankString(decodeURIComponent(encodedValue)) ?? null;
+    } catch {
+      return { status: "unsupported", basePath: resolvedBasePath };
+    }
+    if (value) {
+      selector = { kind: selectorKind, value };
+    }
   }
   return {
     status: "valid",
     basePath: resolvedBasePath,
-    target: {
-      kind: "desktop",
-      control,
-      selector: { kind: selectorKind, value: decoded.value },
-    },
+    target: { kind: "desktop", control, selector },
   };
 }

@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 371771,
-  "reason": "Approved by @steipete for PR #158567 on 2026-09-27: measured startup bundle 371,771 B after main reconciliation and canonical boot-module regeneration, +1,015 B (0.27%) over the previous baseline. Paired baseline and cap retain the 512 B growth and 64 B build-variance allowances, yielding a 372,347 B enforcement limit.",
-  "updatedAt": "2026-09-27"
+  "startupJsGzipBytes": 294961,
+  "reason": "Startup leaf icons, update classification, and lazy English: matched b5b24cf15c2 build 310773 to 294961 B gzip with 7 JS and 1 CSS request.",
+  "updatedAt": "2026-10-23"
 }
